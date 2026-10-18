@@ -1,5 +1,8 @@
 # Claude Code in disposable macOS VMs
 
+## Warning
+While this is meant to provide isolation, this configuration is still early in development. Even with a mature config, we are dealing with LLM agents and there will alway be the possibility of the agent breaking out of it's jail. Safty is not gauranteed.
+
 Run Claude Code against your Xcode projects inside throwaway macOS virtual machines, either as an **unattended job** or as an **attended session**, without giving it access to your Mac, your real repository, or push rights on GitHub. Each run starts from a prebuilt image in seconds, and only the commits it makes come back to you, as a branch you review before anything is built on your own machine.
 
 The whole system is two files:
