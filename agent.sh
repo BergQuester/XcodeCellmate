@@ -1,19 +1,20 @@
 #!/bin/bash
-# ./agent.sh xcode <Xcode.xip>                       new Xcode: rebuild xcode-base, then agent-base
 # ./agent.sh tools                                   new tools/rules: rebuild agent-base only
 # ./agent.sh run [--gui] <repo> <prompt-file> [branch]    unattended job in a throwaway VM
 # ./agent.sh session [--gui] <repo> [branch]              attended Claude Code session in a throwaway VM
 #   --gui  show the VM's window (the agent user's desktop), e.g. to watch the Simulator
 #
 # Builds need:      PKR_VAR_admin_password   (admin password inside the VMs)
-# Jobs & sessions:  ANTHROPIC_API_KEY, GH_TOKEN (fine-grained, READ-ONLY: this is what prevents pushes)
+# Jobs & sessions:  Claude credentials, ONE of:
+#                     CLAUDE_CODE_OAUTH_TOKEN  from `claude setup-token` (Pro/Max/Team/Enterprise subscription)
+#                     ANTHROPIC_API_KEY        Console API key (pay per token)
+#                   GH_TOKEN (fine-grained, READ-ONLY: this is what prevents pushes)
 #
 # Code in:  the starting branch's committed history, as a git bundle (uncommitted work stays behind).
 # Code out: new commits on agent/<name>, fetched into your repo as a bundle. Uncommitted changes
 #           left in the VM become a WIP commit (sessions ask first). This also happens on Ctrl-C.
 set -euo pipefail
 PKR="$(cd "$(dirname "$0")" && pwd)/agent.pkr.hcl"
-
 # ---------- image builds ----------
 
 swap() { tart delete "$1" 2>/dev/null || true; tart rename "$1-next" "$1"; }
@@ -37,7 +38,16 @@ rsh() { ssh "${OPTS[@]}" agent@"$IP" "$@"; }   # run a command in the VM as agen
 start_vm() {
   KIND="$1"; REPO="$(cd "$2" && pwd)"
   BASE="${3:-$(git -C "$REPO" branch --show-current)}"
-  : "${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY}"
+  # Claude credentials: subscription token if set, else API key. Only one is passed into the VM,
+  # because Claude Code prefers ANTHROPIC_API_KEY over CLAUDE_CODE_OAUTH_TOKEN when both exist.
+  if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+    AUTH_VAR=CLAUDE_CODE_OAUTH_TOKEN; AUTH_VAL="$CLAUDE_CODE_OAUTH_TOKEN"
+  elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+    AUTH_VAR=ANTHROPIC_API_KEY; AUTH_VAL="$ANTHROPIC_API_KEY"
+  else
+    echo "Set CLAUDE_CODE_OAUTH_TOKEN (subscription, from 'claude setup-token') or ANTHROPIC_API_KEY" >&2; exit 1
+  fi
+  echo "Claude auth: $AUTH_VAR"
   : "${GH_TOKEN:?set GH_TOKEN (read-only fine-grained token)}"
   git -C "$REPO" rev-parse --verify -q "$BASE" >/dev/null || { echo "No branch '$BASE' in $REPO" >&2; exit 1; }
   [ -z "$(git -C "$REPO" status --porcelain)" ] ||
@@ -66,8 +76,8 @@ start_vm() {
   IP="$ip"
 
   scp -q "${OPTS[@]}" "$OUT/in.bundle" agent@"$IP":
-  printf 'export ANTHROPIC_API_KEY=%q\nexport GH_TOKEN=%q\nexport TART_AGENT_VM=1\nexport AGENT_ATTENDED=%q\nexport AGENT_BASE_BRANCH=%q\nexport AGENT_BRANCH=%q\n' \
-    "$ANTHROPIC_API_KEY" "$GH_TOKEN" "$([ "$KIND" = session ] && echo 1 || echo 0)" "$BASE" "$BRANCH" |
+  printf 'export %s=%q\nexport GH_TOKEN=%q\nexport TART_AGENT_VM=1\nexport AGENT_ATTENDED=%q\nexport AGENT_BASE_BRANCH=%q\nexport AGENT_BRANCH=%q\n' \
+    "$AUTH_VAR" "$AUTH_VAL" "$GH_TOKEN" "$([ "$KIND" = session ] && echo 1 || echo 0)" "$BASE" "$BRANCH" |
     rsh 'umask 077; cat > ~/.job-env'
 
   rsh bash -l -s -- "$BASE" "$BRANCH" "$ORIGIN" <<'SETUP'
