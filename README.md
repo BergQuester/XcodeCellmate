@@ -1,0 +1,689 @@
+# Claude Code in disposable macOS VMs
+
+Run Claude Code against your Xcode projects inside throwaway macOS virtual machines, either as an **unattended job** or as an **attended session**, without giving it access to your Mac, your real repository, or push rights on GitHub. Each run starts from a prebuilt image in seconds, and only the commits it makes come back to you, as a branch you review before anything is built on your own machine.
+
+The whole system is two files:
+
+| File | What it does |
+| --- | --- |
+| `agent.pkr.hcl` | Packer template that builds the two VM images (Xcode layer and agent layer). |
+| `agent.sh` | Builds the images, and runs jobs and sessions in disposable clones of them. |
+
+`CLAUDE-tart-vm-section.md` holds the section to paste into your project's `CLAUDE.md`; the same text is in [Appendix A](#appendix-a-claudemd-section).
+
+---
+
+## Contents
+
+1. [How it works](#1-how-it-works)
+2. [Requirements](#2-requirements)
+3. [Install Tart, Packer and friends](#3-install-tart-packer-and-friends)
+4. [Set up the folder](#4-set-up-the-folder)
+5. [Configure the template](#5-configure-the-template)
+6. [Build the images](#6-build-the-images)
+7. [Credentials](#7-credentials)
+8. [Prepare your project](#8-prepare-your-project)
+9. [Run an unattended job](#9-run-an-unattended-job)
+10. [Run an attended session](#10-run-an-attended-session)
+11. [Review and integrate the results](#11-review-and-integrate-the-results)
+12. [Maintenance: tools, Xcode, macOS, Claude Code](#12-maintenance)
+13. [Security model and its limits](#13-security-model-and-its-limits)
+14. [Troubleshooting](#14-troubleshooting)
+15. [Not yet verified](#15-not-yet-verified)
+16. [Appendix A: CLAUDE.md section](#appendix-a-claudemd-section)
+
+---
+
+## 1. How it works
+
+### Two image layers, one disposable clone per run
+
+```
+ghcr.io/cirruslabs/macos-golden-gate-xcode:27     (Cirrus Labs base: macOS 27 + Homebrew + SSH)
+        │  ./agent.sh xcode <xip>     slow, rebuilt only when Xcode changes
+        ▼
+xcode-base     your Xcode (beta) + command line tools + iOS SDK/simulator runtime + docs
+        │  ./agent.sh tools           fast, rebuilt when tools or rules change
+        ▼
+agent-base     Homebrew tools + non-admin "agent" user + Claude Code + git policy + deny rules
+        │  ./agent.sh run / session   seconds: a copy-on-write clone, nothing installed
+        ▼
+job-… / session-…   throwaway VM, deleted when the run ends
+```
+
+Layering by rate of change means adding a tool doesn't reinstall Xcode, a failed tools build never touches your working images, and job VMs start without installing anything.
+
+### How code gets in and out
+
+Your real repository is **never mounted** into a VM. Only git bundles (single-file snapshots of git history) cross the boundary, so nothing the agent does to git hooks or config can execute on your Mac.
+
+```
+Your Mac                                         Throwaway VM (user "agent")
+────────                                         ───────────────────────────
+repo @ branch ──git bundle──► in.bundle ──scp──► ~/work (clone) on agent/<run-name>
+                                                     │  Claude Code works, commits
+your repo ◄──git fetch── out.bundle ◄──scp───────── new commits only
+  branch agent/<run-name> (not checked out)
+```
+
+- **In:** only the *committed* history of the starting branch. Uncommitted changes in your repo stay behind (the script warns you).
+- **Out:** only commits on the run's branch. When a run ends (normally or with Ctrl-C), leftover uncommitted changes in the VM become a `WIP:` commit (sessions ask first), the new commits are bundled and fetched into your repo as `agent/<run-name>`, and the VM is deleted. Your checked-out branch and working files are never touched.
+
+---
+
+## 2. Requirements
+
+- **An Apple silicon Mac.** Tart uses Apple's Virtualization framework, which runs macOS guests only on Apple silicon.
+- **A host macOS at least as new as the guest.** The images here are macOS 27; running a macOS 27 guest very likely requires a macOS 27 host.
+- **Disk space:** plan on roughly 250 GB free. The base image is large, `xcode-base` is resized to a 200 GB disk (sparse, so it uses less), and Xcode unpacks to tens of GB.
+- **Memory:** each VM is given 16 GB and 8 CPUs by default (adjustable, see [§5](#5-configure-the-template)).
+- **An Apple Developer account** to download Xcode (including betas) from <https://developer.apple.com/download/>.
+- **A Claude subscription (Pro, Max, Team or Enterprise) or an Anthropic API key** for Claude Code (see [§7](#7-credentials)).
+- **A GitHub fine-grained personal access token** with read-only permissions (see [§7](#7-credentials)).
+- **An SSH key pair** on your Mac (`~/.ssh/id_ed25519.pub` by default). Create one with `ssh-keygen -t ed25519` if you don't have it.
+
+Apple's macOS license, enforced by the Virtualization framework, allows at most **two macOS VMs running at once** per Mac. That means two jobs/sessions at a time, or one while an image build is running.
+
+---
+
+## 3. Install Tart, Packer and friends
+
+Install [Homebrew](https://brew.sh) if you don't have it, then:
+
+```sh
+# Tart (the formula moved from cirruslabs/cli to openai/tools after Cirrus Labs joined OpenAI)
+brew install openai/tools/tart
+
+# Packer, from HashiCorp's tap
+brew tap hashicorp/tap
+brew install hashicorp/tap/packer
+
+# Optional: list available image tags from the registry
+brew install crane
+```
+
+Check them:
+
+```sh
+tart --version
+packer version
+```
+
+You don't need to install the Tart Packer plugin yourself: `agent.sh` runs `packer init`, which downloads it.
+
+### Grant your terminal Local Network access
+
+macOS blocks apps from connecting to devices on the local network until you allow it, and the VMs count. Without this, connections to the VM fail with **`No route to host`** and Packer waits forever at "Waiting for SSH".
+
+Open **System Settings → Privacy & Security → Local Network** and turn on the app you run these scripts from (Terminal, iTerm, Warp, VS Code…). Quit and reopen it afterwards. Repeat for any other app you later run `agent.sh` from.
+
+### Softnet (network isolation for runs)
+
+Jobs and sessions start VMs with Tart's `--net-softnet`, which isolates them from your local network. Softnet needs either its binary set SUID root or passwordless `sudo`, so expect to set that up the first time you run a job; check `tart run --help` and Tart's documentation for the exact steps on your version. If you want to get going without it, remove `--net-softnet` from the two `tart run` lines in `agent.sh` (and accept that the VM can then reach your LAN).
+
+### Apple's `container` tool
+
+If you also use Apple's `container` CLI, stop its service while using Tart (`container system stop`); both use the same virtual networking and can interfere.
+
+---
+
+## 4. Set up the folder
+
+Put the files in a folder of their own, for example `~/tartvmconfigs`:
+
+```
+tartvmconfigs/
+├── agent.sh
+├── agent.pkr.hcl
+├── CLAUDE-tart-vm-section.md
+└── README.md
+```
+
+```sh
+cd ~/tartvmconfigs
+chmod +x agent.sh
+./agent.sh            # prints usage
+```
+
+Run every command in this README from that folder.
+
+---
+
+## 5. Configure the template
+
+All the settings you're expected to change are at the top of `agent.pkr.hcl`, under `settings you edit`:
+
+| Setting | Default | Notes |
+| --- | --- | --- |
+| `base_image` | `ghcr.io/cirruslabs/macos-golden-gate-xcode:27` | The starting image. Pin it by digest (`…@sha256:…`) for reproducible builds; see [§12](#12-maintenance). |
+| `sdk_platforms` | empty (= latest iOS) | Simulator runtimes installed with Xcode; see [§6.4](#64-choose-sdk-platforms-and-versions). Can be overridden per build on the command line. |
+| `brew_packages` | `gh`, `jq`, `xcbeautify` | Homebrew packages installed in the agent layer. |
+| `claude_deny_rules` | push, clone, web and SSH commands | Claude Code deny rules, written to managed settings (see [§13](#13-security-model-and-its-limits)). |
+| `ssh_pubkey_path` | `~/.ssh/id_ed25519.pub` | The only key that can log in to job VMs as `agent`. |
+
+VM sizes are set in the two `source` blocks: `cpu_count`, `memory_gb` and `disk_size_gb` in `source "tart-cli" "xcode"`, and `cpu_count`/`memory_gb` in `source "tart-cli" "agent"` (which sizes every job and session VM).
+
+> **Editing the scripts inside `agent.pkr.hcl`:** in the `<<-EOT` blocks, write shell variables as `$VAR`, never `${VAR}`. Packer treats `${…}` as its own placeholders; write `$${VAR}` if you need the braces.
+
+---
+
+## 6. Build the images
+
+### 6.1 Download Xcode
+
+Download the Xcode `.xip` you want (a release or a beta) from <https://developer.apple.com/download/> and leave it where it is, for example `~/Downloads/Xcode_27.2_beta_3.xip`. The build reads it directly from there through a read-only shared folder, so don't move or delete it until the build finishes.
+
+### 6.2 Set the VM admin password
+
+The build replaces the base image's default `admin`/`admin` login with a password you choose. Set it without leaving it in your shell history:
+
+```sh
+read -rs PKR_VAR_admin_password && export PKR_VAR_admin_password
+```
+
+Type the password and press Enter (nothing is shown). Keep it in your password manager; you need it to log in to a VM as `admin`. The variable lasts only for this Terminal window.
+
+### 6.3 Build both layers
+
+```sh
+./agent.sh xcode ~/Downloads/Xcode_27.2_beta_3.xip
+```
+
+What happens:
+
+1. **Base image download.** The first run pulls the Cirrus Labs image from GHCR (tens of GB).
+2. **VM boot and SSH.** Packer clones it to `xcode-base-next`, resizes the disk, boots it and waits for SSH. A VM window opens. One to three minutes is normal.
+3. **Xcode install** (15–30+ minutes, little output). The `.xip` is expanded, moved to `/Applications/<xip name>.app`, every other Xcode is removed, `/Applications/Xcode.app` is symlinked to it, it's selected with `xcode-select` (which also provides the command line tools), the license is accepted and first-launch setup runs.
+4. **Simulator runtimes.** All existing runtimes are deleted, then the platforms you asked for are installed (by default, the latest iOS runtime for this Xcode; several GB each). The SDKs themselves ship inside Xcode. See [§6.4](#64-choose-sdk-platforms-and-versions).
+5. **Documentation (manual step).** Packer pauses with a note. In the VM window, open Xcode. If its *Components* sheet appears, click **Download & Install** (iOS is already installed, so it should finish quickly). Then open **Xcode → Settings → Components** and download **Documentation** if it's offered. Quit Xcode, return to the Terminal, and press **Enter**.
+6. **Checks.** The Xcode version, iOS SDK version and installed runtimes are printed. Confirm they're what you expect.
+7. **Swap.** `xcode-base-next` replaces `xcode-base`.
+8. **Agent layer** (a few minutes, automatic): Homebrew packages, the non-admin `agent` user with your SSH key and automatic login, Claude Code, git identity and push backstop, Claude Code deny rules (printed as JSON so you can check them), and finally the admin password change. `agent-base-next` then replaces `agent-base`.
+
+Confirm the result:
+
+```sh
+tart list        # shows xcode-base and agent-base
+```
+
+### 6.4 Choose SDK platforms and versions
+
+By default the image gets the latest iOS simulator runtime for the Xcode you install. To choose others, list them after the `.xip`:
+
+```sh
+./agent.sh xcode ~/Downloads/Xcode_27.2_beta_3.xip iOS watchOS                # latest iOS and watchOS
+./agent.sh xcode ~/Downloads/Xcode_27.2_beta_3.xip iOS "iOS 26.4"            # latest iOS plus iOS 26.4
+./agent.sh xcode ~/Downloads/Xcode_27.2_beta_3.xip iOS iphonesimulator_22A3351.dmg   # plus an imported image
+```
+
+or set a permanent default in `sdk_platforms` in `agent.pkr.hcl` (command-line arguments override it):
+
+```hcl
+default = ["iOS", "iOS 26.4", "watchOS"]
+```
+
+Each entry is one of:
+
+| Entry | Installs |
+| --- | --- |
+| `iOS`, `watchOS`, `tvOS`, `visionOS` | The latest runtime of that platform for this Xcode (`xcodebuild -downloadPlatform`). |
+| `iOS 26.4` (platform and version or build number) | That specific runtime (`-buildVersion`). If the plain download fails, it's retried with `-architectureVariant arm64`, which some versions require. |
+| `something.dmg` | A runtime disk image imported with `xcodebuild -importPlatform`. Put the file in the same folder as the `.xip`. |
+
+Quote entries containing spaces. An empty list means latest iOS. The SDKs for every platform come with Xcode; this only controls which **simulator runtimes** are installed. Only what you list is installed, so include `iOS` if you add other platforms and still want the latest iOS.
+
+**Older runtimes.** Xcode 27's `xcodebuild` has been reported to refuse runtimes older than iOS 26 ("iOS 18.6 is not available for download") even though Xcode's *Components* pane can still add them. If an entry fails, the build stops with a message. Remove it and add that platform by hand at the documentation pause (**Xcode → Settings → Components**, then add the platform), or export a `.dmg` on a Mac with an older Xcode (`xcodebuild -downloadPlatform iOS -buildVersion 18.6 -exportPath ~/runtimes`) and import that.
+
+Keep the Terminal window open for the whole build; closing it stops Packer. If a build fails or you stop it, just rerun the same command: it deletes the half-built `-next` image and starts again, and your existing images are untouched.
+
+---
+
+## 7. Credentials
+
+Jobs and sessions need two things in the Terminal you run them from: a **Claude credential** (a subscription token *or* an API key) and a **GitHub token**.
+
+### Claude: subscription token (Pro, Max, Team, Enterprise)
+
+To use your Claude subscription instead of paying per token, generate a long-lived token on your Mac:
+
+```sh
+claude setup-token
+```
+
+It walks you through a browser sign-in and prints a token valid for one year. It isn't saved anywhere, so copy it into the Keychain (below). The token only grants inference (it can't start Remote Control sessions). See [Authentication](https://code.claude.com/docs/en/authentication) in the Claude Code docs.
+
+```sh
+export CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-…
+```
+
+Things to know:
+
+- **Runs count against your plan's usage limits**, shared with your normal Claude use. Long unattended jobs can use a lot; if you hit a limit mid-job, the job stops making progress until the limit resets.
+- **Auto mode** (used by `agent.sh run`) is available on Max, Team and Enterprise, but not on every plan or model; if a job's log shows nearly every command denied, auto mode wasn't available (see [§14](#14-troubleshooting)).
+- **Treat the token like a password for your subscription.** Anyone who gets it can use your plan for a year. It's exposed inside the VM during runs, so the protections in [§13](#13-security-model-and-its-limits) apply to it too. If it leaks, look in your Claude account settings for a way to revoke it (or contact support), and generate a new one.
+- In an attended session, Claude Code may show its first-run setup screens (theme and so on) because each VM is fresh. Click through them.
+
+### Claude: API key (pay per token)
+
+```sh
+export ANTHROPIC_API_KEY=sk-ant-…
+```
+
+Use a key from the [Claude Console](https://console.anthropic.com/) dedicated to this purpose, with a spend limit. Treat it as exposed to the VM.
+
+### Which one is used
+
+If `CLAUDE_CODE_OAUTH_TOKEN` is set, `agent.sh` passes only that into the VM; otherwise it passes `ANTHROPIC_API_KEY`. Only one is ever passed, because Claude Code prefers an API key over a subscription token when both are present. The script prints `Claude auth: …` at the start of each run so you can see which.
+
+### GitHub token: read-only, fine-grained
+
+The read-only permission on this token is what **actually** prevents pushes; the other push blocks are backups. Create it at **GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens**:
+
+- **Repository access:** only the repositories the agent needs, including any private Swift package dependencies.
+- **Permissions:** *Contents: Read-only* (metadata read is added automatically). Add *Issues: Read-only* and/or *Pull requests: Read-only* only if your jobs read them.
+- **Expiration:** short, and rotate it.
+
+```sh
+export GH_TOKEN=github_pat_…
+```
+
+### Keep them out of your shell history
+
+Store both in the macOS Keychain once:
+
+```sh
+security add-generic-password -a "$USER" -s agent-claude-oauth -w   # prompts for the setup-token
+security add-generic-password -a "$USER" -s agent-anthropic -w      # or: prompts for the API key
+security add-generic-password -a "$USER" -s agent-github -w         # prompts for the GitHub token
+```
+
+and load them when needed:
+
+```sh
+export CLAUDE_CODE_OAUTH_TOKEN="$(security find-generic-password -a "$USER" -s agent-claude-oauth -w)"
+# or: export ANTHROPIC_API_KEY="$(security find-generic-password -a "$USER" -s agent-anthropic -w)"
+export GH_TOKEN="$(security find-generic-password -a "$USER" -s agent-github -w)"
+```
+
+Inside the VM the values are written to `~/.job-env`, readable only by `agent`, and disappear with the VM.
+
+---
+
+## 8. Prepare your project
+
+### 8.1 Add the VM section to `CLAUDE.md`
+
+Paste [Appendix A](#appendix-a-claudemd-section) (or `CLAUDE-tart-vm-section.md`) into your repository's `CLAUDE.md`. It only takes effect inside these VMs: the script sets `TART_AGENT_VM=1`, and the section tells Claude to ignore it otherwise, so it's safe to keep in the normal file. Auto mode's safety classifier reads `CLAUDE.md` too, so these rules steer its decisions as well as Claude's.
+
+It tells Claude to: commit early and often (only commits survive), stay on its branch, never push, never clone other repositories, not use the web or SSH, build with `CODE_SIGNING_ALLOWED=NO`, format the project file, leave build scripts, dependencies and signing alone unless asked, keep credentials secret, treat classifier blocks as signals, and finish with a summary.
+
+### 8.2 Add your project's specifics
+
+Below the VM section, add what an agent needs to work on *your* project without guessing:
+
+````markdown
+## Building and testing this project
+
+- Scheme: `MyApp`
+- Build: `xcodebuild -scheme MyApp -destination 'platform=iOS Simulator,name=iPhone 17' CODE_SIGNING_ALLOWED=NO build | xcbeautify`
+- Test:  `xcodebuild -scheme MyApp -destination 'platform=iOS Simulator,name=iPhone 17' CODE_SIGNING_ALLOWED=NO test | xcbeautify`
+- Lint/format: …
+- Code style and conventions: …
+- Areas not to touch: …
+````
+
+Check the simulator names available in the image by opening a session and running `xcrun simctl list devices available`.
+
+### 8.3 Commit it on the branch you'll start from
+
+The VM receives only committed history, so commit `CLAUDE.md` (and any other setup) on the branch you'll pass to `agent.sh` before running.
+
+### 8.4 Check `.gitignore`
+
+Leftover changes at the end of a run are committed as `WIP:` **including untracked files**. Make sure in-repo build output (for example `.build/`, `DerivedData/` if you keep it in the repo, `*.xcresult`) is ignored, so it doesn't end up in those commits.
+
+---
+
+## 9. Run an unattended job
+
+### 9.1 Write the prompt file
+
+The prompt file is the agent's whole briefing; it can't ask you anything mid-job. Good prompts include:
+
+- The task and what "done" looks like (acceptance criteria, tests that should pass).
+- Pointers to the relevant files or types.
+- Constraints specific to this job ("don't change the public API", "keep iOS 18 support").
+- A reminder to commit after each working step (the `CLAUDE.md` section covers this, but it doesn't hurt).
+
+Example `job.md`:
+
+```markdown
+Add pull-to-refresh to `FeedView` that calls `FeedModel.reload()`.
+
+Done when:
+- Pulling down on the feed triggers a reload and shows the system refresh indicator.
+- `FeedModelTests` has a test covering reload being called.
+- The app builds and all tests pass on the iPhone 17 simulator.
+
+Don't change `FeedModel`'s public API.
+```
+
+### 9.2 Run it
+
+```sh
+./agent.sh run ~/src/MyApp job.md              # starts from your current branch
+./agent.sh run ~/src/MyApp job.md develop      # or from a named branch
+./agent.sh run --gui ~/src/MyApp job.md        # with the VM window shown
+```
+
+### 9.3 What happens
+
+1. The starting branch is bundled into `~/agent-jobs/job-<date>-<time>/in.bundle`.
+2. `agent-base` is cloned to `job-…` and booted headless (or with its window, with `--gui`) on Softnet.
+3. The bundle, the prompt and the credentials are copied in. The VM clones the bundle to `~/work`, creates branch `agent/job-…`, and points `origin` at your GitHub repository for fetching only (its push URL is set to `PUSH-DISABLED`).
+4. Claude Code runs `claude -p "<prompt>" --permission-mode auto` in `~/work` until it decides it's done. There's no time limit.
+5. Leftover changes become a `WIP:` commit, new commits are bundled and fetched into your repo as `agent/job-…`, and the VM is deleted.
+
+Pressing **Ctrl-C** also goes through step 5, so work committed so far is kept.
+
+### 9.4 Watching and output
+
+`claude -p` mostly prints its final summary at the end, so the Terminal looks idle for a long time while it works. Everything is saved in `~/agent-jobs/job-…/`:
+
+| File | Contents |
+| --- | --- |
+| `prompt.md` | The prompt it ran with. |
+| `agent.log` | Claude's output, ending with its summary. |
+| `in.bundle` / `out.bundle` | What went in and what came out. |
+| `tart.log` | The VM's own log. |
+
+---
+
+## 10. Run an attended session
+
+```sh
+./agent.sh session ~/src/MyApp                 # from your current branch
+./agent.sh session ~/src/MyApp develop         # or from a named branch
+./agent.sh session --gui ~/src/MyApp           # with the VM window shown
+```
+
+You land in Claude Code, running in the VM in `~/work` on branch `agent/session-…`, in your Terminal. Claude starts in your default permission mode (auto mode on current versions; Shift+Tab switches). The script sets `AGENT_ATTENDED=1`, so the `CLAUDE.md` section lets Claude ask you questions; all the other rules still apply.
+
+- Quitting Claude leaves you in a shell in `~/work`, where you can run `git log`, `xcodebuild`, or `claude` again.
+- Exiting that shell ends the session. If there are uncommitted changes, they're listed and you're asked `Keep them as a WIP commit? [Y/n]`. Then the commits are fetched into your repo and the VM is deleted.
+
+### Watching the Simulator (`--gui`)
+
+With `--gui`, the VM window shows the `agent` user's desktop (the image logs `agent` in automatically). Run `open -a Simulator` in the VM shell, or ask Claude to, to watch simulator runs.
+
+- **Don't close the VM window**: that shuts the VM down before your commits are collected. End the session from the Terminal.
+- On a new account's first login macOS may show setup screens (Apple Account, Siri…). They don't affect Claude, which works over SSH; see [§14](#14-troubleshooting).
+
+### Continuing earlier work
+
+Start a job or session from an agent branch to build on it:
+
+```sh
+./agent.sh session ~/src/MyApp agent/job-20261018-101500
+```
+
+The new run gets its own branch on top of it.
+
+---
+
+## 11. Review and integrate the results
+
+Every run leaves a branch `agent/<run-name>` in your repository. Nothing is merged, checked out or pushed for you.
+
+### 11.1 Read what it did
+
+```sh
+cd ~/src/MyApp
+git log --stat main..agent/job-…        # the commits, with files changed
+git diff main...agent/job-…             # the full change (three dots: since the branch point)
+cat ~/agent-jobs/job-…/agent.log        # Claude's summary and notes
+```
+
+Use whatever diff tool you prefer: `git difftool`, Xcode's source control navigator, GitHub Desktop, Tower, Fork, etc.
+
+### 11.2 Check these before building on your Mac
+
+Building in Xcode on your Mac is the first time the agent's code runs outside a VM. Look closely at changes to:
+
+- **The project file** (`*.xcodeproj/project.xcproj`): Run Script build phases, build rules, new targets.
+- **Schemes** (`*.xcscheme`): pre/post actions.
+- **Dependencies**: `Package.swift`, `Package.resolved`, newly added packages (package plugins and macros run during builds; Xcode will ask you to trust new ones, so read what you're trusting).
+- **Signing and entitlements**: `*.entitlements`, signing settings, provisioning.
+- **Automation and config**: CI workflows (`.github/`), `.claude/` settings, scripts, Makefiles, git hooks configs.
+- **Tests**: deleted or weakened tests and assertions.
+- **`WIP:` commits**: untracked files that shouldn't be in the repo.
+
+### 11.3 Build and test it yourself
+
+```sh
+git switch agent/job-…
+# open in Xcode, build and run the tests
+```
+
+or check it out in a separate worktree so your current work isn't disturbed:
+
+```sh
+git worktree add ../MyApp-review agent/job-…
+```
+
+### 11.4 Integrate
+
+Pick the history you want:
+
+```sh
+git switch main
+git merge --no-ff agent/job-…        # keep the agent's commits as-is
+git merge --squash agent/job-…       # one commit; then: git commit
+git cherry-pick <commit>…            # just some of them
+git rebase -i main agent/job-…       # tidy commits first, then merge
+```
+
+Then push and open a pull request **from your Mac**, with your own credentials, as you normally would.
+
+### 11.5 Ask for changes
+
+Start a new job or session from the agent branch with a prompt describing the fixes ([§10](#continuing-earlier-work)).
+
+### 11.6 Clean up
+
+```sh
+git branch -D agent/job-…                   # after merging or rejecting
+rm -rf ~/agent-jobs/job-…                   # logs and bundles you no longer need
+git worktree remove ../MyApp-review         # if you used one
+```
+
+`~/agent-jobs` is your audit trail; keep it as long as it's useful.
+
+---
+
+## 12. Maintenance
+
+### Add a tool or change deny rules
+
+Edit `brew_packages` or `claude_deny_rules` in `agent.pkr.hcl`, then:
+
+```sh
+read -rs PKR_VAR_admin_password && export PKR_VAR_admin_password
+./agent.sh tools
+```
+
+This rebuilds only the agent layer, in a few minutes. Any change to the agent-layer setup (the `agent` build block) needs the same command.
+
+### Update Xcode
+
+Download the new `.xip`, then:
+
+```sh
+./agent.sh xcode ~/Downloads/Xcode_27.3_beta_1.xip
+```
+
+This rebuilds both layers, including the manual documentation step. Add platform arguments to change the simulator runtimes ([§6.4](#64-choose-sdk-platforms-and-versions)). To be able to roll back, copy the current image first:
+
+```sh
+tart clone xcode-base xcode-base-27.2b3
+```
+
+To roll back, restore that copy (`tart delete xcode-base && tart clone xcode-base-27.2b3 xcode-base`) and run `./agent.sh tools`.
+
+### Update macOS
+
+Don't run Software Update inside the VMs: updates in these VMs are unreliable and can stall, partly because the disk resize affects the recovery partition the updater relies on. Instead, take the new macOS from a newer base image:
+
+1. Look for a newer tag or digest of the base image, at <https://github.com/cirruslabs/macos-image-templates/pkgs/container/macos-golden-gate-xcode> or with `crane ls ghcr.io/cirruslabs/macos-golden-gate-xcode`. Cirrus rebuilds its images regularly.
+2. Set `base_image` in `agent.pkr.hcl` to it, ideally by digest: `ghcr.io/cirruslabs/macos-golden-gate-xcode@sha256:…`.
+3. Run `./agent.sh xcode <your .xip>`.
+
+### Update Claude Code
+
+Claude Code is installed when the agent layer is built. Rebuild periodically (`./agent.sh tools`) to pick up new versions.
+
+### Disk space
+
+`tart list` shows images and sizes. Delete what you don't need with `tart delete <name>`. Downloaded registry images are cached by Tart; `tart prune` cleans its caches (check `tart prune --help`).
+
+---
+
+## 13. Security model and its limits
+
+### Layers of protection
+
+| Layer | Protects against |
+| --- | --- |
+| **Throwaway VM** per run | Damage to your Mac; anything persisting between runs. |
+| **Git bundles instead of mounts** | The agent touching your real repository, or planting git hooks/config that run on your Mac. |
+| **Non-admin `agent` user**, key-only SSH | System-level changes inside the VM; the admin password is never given to the agent. |
+| **Read-only GitHub token** | Pushes, PRs, comments, any write to GitHub. This is the real push guarantee. |
+| **Disabled push URL and `pre-push` hook** | Accidental pushes (backup only: the agent could undo these). |
+| **Claude Code deny rules** in root-owned managed settings | `git push`, `git clone`, `gh repo clone/fork`, `git submodule add`, `WebFetch`, `WebSearch`, `curl`, `wget`, `ssh`, `scp`, `sftp`, `rsync`. Highest precedence, apply in every permission mode, and the agent can't edit them. |
+| **Auto mode** | A classifier reviews risky actions before they run, including sending data to external endpoints and download-and-execute, and isn't influenced by the contents of files and pages Claude reads. |
+| **Softnet** | The VM reaching your local network. |
+| **`CLAUDE.md` rules** | Steering Claude (and the classifier) away from pushing, cloning, web/SSH, build-script and dependency changes. |
+| **Your review** before building on your Mac | Malicious or broken code, build scripts, dependencies, signing changes. |
+
+### What's still exposed
+
+- **Inside the VM, during a run:** your source code, the Claude credential (subscription token or API key) and the GitHub token. The VM has internet access (Claude Code needs Anthropic's API, and git/xcodebuild need GitHub), so a determined or prompt-injected agent could try to send them out. Auto mode and the deny rules make this much harder, not impossible. Use a dedicated API key with a spend limit (or keep the subscription token's exposure in mind) and a short-lived, narrowly scoped GitHub token.
+- **Deny rules match commands as written.** `python3 -c 'import urllib…'`, `/usr/bin/curl`, or a script containing `git push` won't match. They're a backstop.
+- **Auto mode reduces risk but isn't a guarantee.** The classifier can still allow a risky action, which is why Anthropic recommends running it in isolated environments like these VMs.
+- **Network-level filtering isn't set up.** Tart's `--net-softnet-allow`/`--net-softnet-block` filter by IP range (fragile for services like GitHub), and Claude Code's Bash sandbox can restrict domains but hasn't been tested with `xcodebuild` and the Simulator here.
+- **`xcode-base` keeps the default `admin`/`admin` password.** It never runs jobs and stays on your Mac, but don't share or push it to a registry.
+- **Xcode betas** are pre-release software running agent-written code; that's another reason the review step matters.
+
+---
+
+## 14. Troubleshooting
+
+| Symptom | Cause and fix |
+| --- | --- |
+| `No route to host` connecting to the VM; Packer stuck at "Waiting for SSH" | Your terminal app lacks Local Network permission ([§3](#grant-your-terminal-local-network-access)). Also check VPNs (`route get <vm-ip>` should show a `bridge…` interface, not `utun…`) and stop Apple's `container` service. |
+| Packer times out waiting for SSH, VM is on the desktop | Raise `ssh_timeout` in both `source` blocks (e.g. `"600s"`). If SSH is refused, check *System Settings → General → Sharing → Remote Login* in the VM. |
+| `PKR_VAR_admin_password: export PKR_VAR_admin_password first` | Set it in this Terminal window ([§6.2](#62-set-the-vm-admin-password)). |
+| `Not found: /Volumes/My Shared Files/xcode/…` | The `.xip` path is wrong or the file moved. Pass the path to the `.xip` as it is on your Mac. |
+| `stat agent-base.pkr.hcl: no such file or directory` | Run `agent.sh` from the folder with both files, or keep them together. |
+| Build fails at `tart rename` | Your Tart version may not have `rename`. Run `tart --help`; as a workaround, change the `tart rename` line in `swap()` in `agent.sh` to `tart clone "$1-next" "$1" && tart delete "$1-next"`. |
+| Build fails at `sysadminctl -autologin` | Syntax may differ on your macOS version; check `sysadminctl -h` in a VM. |
+| `<platform> <version> is not available for download` | The retry with `-architectureVariant arm64` failed too. This Xcode may not offer that runtime from the command line; see *Older runtimes* in [§6.4](#64-choose-sdk-platforms-and-versions). |
+| `xcrun simctl runtime delete all` fails | Check `xcrun simctl runtime delete --help`; delete runtimes by identifier instead (`xcrun simctl runtime list`). |
+| A job's log shows nearly every command denied | Auto mode wasn't available, so the session started in Manual mode, which denies everything that would prompt in `-p` runs. Check the Claude Code version and auto mode requirements in the [permission modes docs](https://code.claude.com/docs/en/permission-modes). |
+| Softnet errors when starting a run | Softnet needs SUID or passwordless sudo ([§3](#softnet-network-isolation-for-runs)); or remove `--net-softnet` to test. |
+| Can't start a VM: limit reached | Only two macOS VMs can run at once. `tart list` shows running ones; `tart stop <name>`. |
+| macOS setup screens in the `--gui` window | First login of the `agent` account in each fresh clone. Harmless for Claude. Getting past them once in the image needs an extra build step. |
+| A run was killed and its VM is left over | `tart list`, then `tart stop job-…; tart delete job-…`. If `~/agent-jobs/<run>/out.bundle` exists, fetch it: `git fetch ~/agent-jobs/<run>/out.bundle agent/<run>:agent/<run>`. |
+| `Remote host identification has changed` warnings | Shouldn't happen: the scripts don't record VM host keys, since each VM is new. For manual `ssh`, add `-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null`. |
+| Software Update in a VM stalls | Expected; see [Update macOS](#update-macos). Stop the VM and delete it. |
+
+### Logging in to a VM yourself
+
+```sh
+tart list                                   # find the VM name
+ssh admin@"$(tart ip <name>)"               # as admin, with your admin password
+ssh agent@"$(tart ip <name>)"               # as agent, with your SSH key
+```
+
+---
+
+## 15. Not yet verified
+
+These parts were written from documentation or memory and haven't been confirmed end-to-end; check them on your first runs:
+
+- `tart rename` (used to swap in new images) and `sysadminctl -autologin set`.
+- `xcrun simctl runtime delete all`.
+- Softnet setup and SSH from the host into a VM running on Softnet.
+- Auto mode's availability and behaviour in `claude -p` with your Claude Code version.
+- Whether the release (not beta) Xcode 27.2 bundles `xcprojformatter`.
+- Whether macOS setup screens appear in `--gui` sessions.
+- How the iOS Simulator performs inside a Tart guest.
+
+---
+
+## Appendix A: CLAUDE.md section
+
+The same text as `CLAUDE-tart-vm-section.md`. Paste it into your project's `CLAUDE.md`.
+
+````markdown
+## Running in a disposable VM
+
+**Check this first.** Run `echo "$TART_AGENT_VM $AGENT_ATTENDED"` at the start of every session.
+
+- `1 0`: you are an **unattended job** in a throwaway macOS VM (`agent.sh run`). Nobody can answer questions; every rule in this section applies.
+- `1 1`: you are in an **attended session** in a throwaway macOS VM (`agent.sh session`). A developer is at the keyboard: ask when something is unclear, and they decide when the session ends. Every other rule in this section still applies.
+- Blank: you are on the developer's own Mac. Ignore this section and work as usual.
+
+In the VM, these environment variables are also set:
+
+- `AGENT_BRANCH`: the branch you are working on (already checked out).
+- `AGENT_BASE_BRANCH`: the branch you started from.
+
+### Only commits survive
+
+The VM is deleted when you finish. The only thing kept is the commits on `$AGENT_BRANCH` that are not on `$AGENT_BASE_BRANCH`. Uncommitted changes, untracked files, other branches, stashes and anything outside the repo are lost.
+
+- Commit early and often: after each self-contained step that builds, and at least every time you would otherwise stop to report progress.
+- Write clear commit messages: a short summary line, then what changed and why. Record any assumptions you made in the message; in unattended jobs nobody can answer questions.
+- Stay on `$AGENT_BRANCH`. Don't create or switch to other branches, and don't use `git stash` as storage.
+- Don't rewrite history below `$AGENT_BASE_BRANCH` (no rebasing onto other branches, no amending or squashing commits you didn't make in this job). Amending your own unpublished commits is fine.
+- If you can't finish, commit what you have with a message starting `WIP:` that says what's done, what isn't, and what you'd try next.
+- Before finishing, run `git status` and make sure the working tree is clean.
+
+### Never push
+
+You have read-only GitHub access. Don't run `git push`, don't change remotes or push URLs, don't disable the pre-push hook, and don't try to open pull requests, issues or comments. A blocked push is expected, not an error to work around. The developer reviews your commits and decides what to publish.
+
+### Don't clone repositories
+
+Work only in the checkout you started in. Don't clone other git repositories: no `git clone`, `gh repo clone`, `git submodule add`, or downloading a repo as an archive, including to read code for reference. Resolving the project's own declared dependencies through the build tools (for example `xcodebuild -resolvePackageDependencies` for Swift packages already listed in the project) is fine. If the task seems to need code from another repository, don't fetch it; say so in your final summary and in a `WIP:` commit if you can't continue without it.
+
+### No web or SSH access
+
+Don't browse or download from the web: no web search or fetch tools, and no `curl`, `wget` or similar HTTP clients, including in scripts you write and run. Don't use `ssh`, `scp`, `sftp` or `rsync` to reach other machines. Work from the repository, the installed tools and Xcode's documentation. Fetching the project's declared dependencies through the build tools and using `gh` or `git fetch` against this repository's GitHub remote are the only network access you need. If the task requires information you can't get this way, say so in your final summary.
+
+### Blocked actions
+
+You're running in auto mode: a safety classifier reviews actions and may block some. A blocked action is a signal, not an obstacle to route around. Don't retry it in another form; choose a different approach that stays within these rules. In an attended session, tell the developer what was blocked and why you needed it. In an unattended job, if you can't finish without it, describe it in your final summary.
+
+### Building and testing
+
+- Build and test with `xcodebuild`, always with `CODE_SIGNING_ALLOWED=NO`. There are no signing identities in the VM.
+- Use an iOS Simulator destination. List what exists with `xcrun simctl list devices available`.
+- Don't commit a change that doesn't build. If tests fail and you can't fix them, say so in the commit message.
+- Pipe long `xcodebuild` output through `xcbeautify` to keep it readable.
+
+### Project file
+
+- After editing `*.xcodeproj/project.xcproj`, run `xcprojformatter --update <path to the .xcodeproj>` if it's available, and confirm the project still builds.
+- Don't add or change Run Script build phases, build rules, scheme pre/post actions, package dependencies in `Package.swift`, or signing settings unless the task explicitly asks for it. If the task needs one of these, make it a separate commit and explain it in the message, because the developer reviews these before building on their own Mac.
+
+### Secrets and scope
+
+- `~/.job-env` holds API credentials. Never print, copy, log or commit its contents, and never write tokens into files in the repo.
+- Only work inside the repo checkout. Don't install system-wide software or change macOS settings.
+
+### Finishing
+
+End with a short summary: what you did, the commits you made, what you verified (builds, tests), anything left undone, and assumptions the developer should check. In unattended jobs this summary is saved to the job log. In attended sessions, give it when the developer says they're wrapping up.
+````
