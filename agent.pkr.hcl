@@ -192,6 +192,10 @@ build {
       sudo sysadminctl -addUser agent -fullName "Claude Agent" -password "$AGENT_PW" -home /Users/agent
       sudo createhomedir -c -u agent >/dev/null
 
+      # Log in as agent at boot, so the VM window (agent.sh --gui) shows agent's
+      # desktop and the Simulator it launches, and simulator/UI tests have a GUI session.
+      sudo sysadminctl -autologin set -userName agent -password "$AGENT_PW"
+
       # Key-only SSH login from your Mac.
       sudo -u agent mkdir -p /Users/agent/.ssh
       echo "$AGENT_SSH_PUBKEY" | sudo -u agent tee /Users/agent/.ssh/authorized_keys >/dev/null

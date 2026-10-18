@@ -1,8 +1,9 @@
 #!/bin/bash
 # ./agent.sh xcode <Xcode.xip>                       new Xcode: rebuild xcode-base, then agent-base
 # ./agent.sh tools                                   new tools/rules: rebuild agent-base only
-# ./agent.sh run <repo> <prompt-file> [branch]       unattended job in a throwaway VM
-# ./agent.sh session <repo> [branch]                 attended Claude Code session in a throwaway VM
+# ./agent.sh run [--gui] <repo> <prompt-file> [branch]    unattended job in a throwaway VM
+# ./agent.sh session [--gui] <repo> [branch]              attended Claude Code session in a throwaway VM
+#   --gui  show the VM's window (the agent user's desktop), e.g. to watch the Simulator
 #
 # Builds need:      PKR_VAR_admin_password   (admin password inside the VMs)
 # Jobs & sessions:  ANTHROPIC_API_KEY, GH_TOKEN (fine-grained, READ-ONLY: this is what prevents pushes)
@@ -28,7 +29,7 @@ build() {  # build <layer> [packer args...]  -> builds "<layer>-base-next", then
 # ---------- throwaway VMs ----------
 
 OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ServerAliveInterval=60)
-KIND="" REPO="" BASE="" BRANCH="" OUT="" VM="" IP=""
+GUI=0 KIND="" REPO="" BASE="" BRANCH="" OUT="" VM="" IP=""
 
 rsh() { ssh "${OPTS[@]}" agent@"$IP" "$@"; }   # run a command in the VM as agent
 
@@ -52,7 +53,12 @@ start_vm() {
   tart clone agent-base "$name"; VM="$name"
   trap finish EXIT
   trap 'exit 130' INT TERM          # make Ctrl-C go through finish()
-  tart run --no-graphics --net-softnet "$VM" >"$OUT/tart.log" 2>&1 &
+  if [ "$GUI" = 1 ]; then
+    tart run --net-softnet "$VM" >"$OUT/tart.log" 2>&1 &
+    echo "The VM window will open. Don't close it: end the session from this Terminal so commits are collected."
+  else
+    tart run --no-graphics --net-softnet "$VM" >"$OUT/tart.log" 2>&1 &
+  fi
   echo "Booting $VM..."
   local ip
   until ip=$(tart ip "$VM" 2>/dev/null); do sleep 2; done
@@ -134,6 +140,7 @@ run_session() {  # <repo> [branch]
   echo
   echo "Claude Code is starting in the VM, in ~/work on $BRANCH."
   echo "Quitting Claude leaves you in a shell there; exit that shell to end the session."
+  [ "$GUI" = 1 ] && echo "To watch the Simulator, run 'open -a Simulator' in the VM (or ask Claude to)."
   echo
   ssh -t "${OPTS[@]}" agent@"$IP" "zsh -lc 'cd ~/work && . ~/.job-env && { claude; exec zsh -l; }'" || true
 }
@@ -151,7 +158,10 @@ case "${1:-}" in
     : "${PKR_VAR_admin_password:?export PKR_VAR_admin_password first}"
     build agent
     ;;
-  run)     shift; run_job "$@" ;;
-  session) shift; run_session "$@" ;;
-  *) sed -n '2,5p' "$0"; exit 1 ;;
+  run|session)
+    cmd="$1"; shift
+    if [ "${1:-}" = --gui ]; then GUI=1; shift; fi
+    if [ "$cmd" = run ]; then run_job "$@"; else run_session "$@"; fi
+    ;;
+  *) sed -n '2,6p' "$0"; exit 1 ;;
 esac
