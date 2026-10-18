@@ -1,10 +1,15 @@
 #!/bin/bash
-# ./agent.sh xcode <Xcode.xip>                    new Xcode: rebuild xcode-base, then agent-base
-# ./agent.sh tools                                new tools (brew_packages): rebuild agent-base only
-# ./agent.sh run <repo> <prompt-file> [branch]    run a job in a throwaway VM
+# ./agent.sh xcode <Xcode.xip>                       new Xcode: rebuild xcode-base, then agent-base
+# ./agent.sh tools                                   new tools/rules: rebuild agent-base only
+# ./agent.sh run <repo> <prompt-file> [branch]       unattended job in a throwaway VM
+# ./agent.sh session <repo> [branch]                 attended Claude Code session in a throwaway VM
 #
-# Builds need:  PKR_VAR_admin_password   (admin password inside the VMs)
-# Jobs need:    ANTHROPIC_API_KEY, GH_TOKEN (fine-grained, READ-ONLY: this is what prevents pushes)
+# Builds need:      PKR_VAR_admin_password   (admin password inside the VMs)
+# Jobs & sessions:  ANTHROPIC_API_KEY, GH_TOKEN (fine-grained, READ-ONLY: this is what prevents pushes)
+#
+# Code in:  the starting branch's committed history, as a git bundle (uncommitted work stays behind).
+# Code out: new commits on agent/<name>, fetched into your repo as a bundle. Uncommitted changes
+#           left in the VM become a WIP commit (sessions ask first). This also happens on Ctrl-C.
 set -euo pipefail
 PKR="$(cd "$(dirname "$0")" && pwd)/agent.pkr.hcl"
 
@@ -20,37 +25,47 @@ build() {  # build <layer> [packer args...]  -> builds "<layer>-base-next", then
   swap "$layer-base"
 }
 
-# ---------- jobs ----------
+# ---------- throwaway VMs ----------
 
-run_job() {
-  local REPO PROMPT_FILE BASE JOB BRANCH OUT ORIGIN IP
-  REPO="$(cd "$1" && pwd)"; PROMPT_FILE="$2"
+OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ServerAliveInterval=60)
+KIND="" REPO="" BASE="" BRANCH="" OUT="" VM="" IP=""
+
+rsh() { ssh "${OPTS[@]}" agent@"$IP" "$@"; }   # run a command in the VM as agent
+
+# start_vm <job|session> <repo> [branch]: clone agent-base, boot it, copy the branch in.
+start_vm() {
+  KIND="$1"; REPO="$(cd "$2" && pwd)"
   BASE="${3:-$(git -C "$REPO" branch --show-current)}"
   : "${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY}"
   : "${GH_TOKEN:?set GH_TOKEN (read-only fine-grained token)}"
+  git -C "$REPO" rev-parse --verify -q "$BASE" >/dev/null || { echo "No branch '$BASE' in $REPO" >&2; exit 1; }
+  [ -z "$(git -C "$REPO" status --porcelain)" ] ||
+    echo "Note: $REPO has uncommitted changes; they are NOT copied into the VM."
 
-  JOB="job-$(date +%Y%m%d-%H%M%S)"; BRANCH="agent/$JOB"
-  OUT="$HOME/agent-jobs/$JOB"; mkdir -p "$OUT"
+  local name ORIGIN
+  name="$KIND-$(date +%Y%m%d-%H%M%S)"
+  BRANCH="agent/$name"; OUT="$HOME/agent-jobs/$name"; mkdir -p "$OUT"
   ORIGIN="$(git -C "$REPO" remote get-url origin 2>/dev/null | sed -E 's#^git@github\.com:#https://github.com/#' || true)"
 
   git -C "$REPO" bundle create "$OUT/in.bundle" "$BASE"
-  cp "$PROMPT_FILE" "$OUT/prompt.md"
 
-  tart clone agent-base "$JOB"
-  trap "tart stop '$JOB' >/dev/null 2>&1 || true; tart delete '$JOB' || true" EXIT
-  tart run --no-graphics --net-softnet "$JOB" >"$OUT/tart.log" 2>&1 &
+  tart clone agent-base "$name"; VM="$name"
+  trap finish EXIT
+  trap 'exit 130' INT TERM          # make Ctrl-C go through finish()
+  tart run --no-graphics --net-softnet "$VM" >"$OUT/tart.log" 2>&1 &
+  echo "Booting $VM..."
+  local ip
+  until ip=$(tart ip "$VM" 2>/dev/null); do sleep 2; done
+  until ssh "${OPTS[@]}" agent@"$ip" true 2>/dev/null; do sleep 2; done
+  IP="$ip"
 
-  local OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ServerAliveInterval=60)
-  until IP=$(tart ip "$JOB" 2>/dev/null); do sleep 2; done
-  until ssh "${OPTS[@]}" agent@"$IP" true 2>/dev/null; do sleep 2; done
+  scp -q "${OPTS[@]}" "$OUT/in.bundle" agent@"$IP":
+  printf 'export ANTHROPIC_API_KEY=%q\nexport GH_TOKEN=%q\nexport TART_AGENT_VM=1\nexport AGENT_ATTENDED=%q\nexport AGENT_BASE_BRANCH=%q\nexport AGENT_BRANCH=%q\n' \
+    "$ANTHROPIC_API_KEY" "$GH_TOKEN" "$([ "$KIND" = session ] && echo 1 || echo 0)" "$BASE" "$BRANCH" |
+    rsh 'umask 077; cat > ~/.job-env'
 
-  scp "${OPTS[@]}" "$OUT/in.bundle" "$OUT/prompt.md" agent@"$IP":
-  printf 'export ANTHROPIC_API_KEY=%q\nexport GH_TOKEN=%q\n' "$ANTHROPIC_API_KEY" "$GH_TOKEN" |
-    ssh "${OPTS[@]}" agent@"$IP" 'umask 077; cat > ~/.job-env'
-
-  ssh "${OPTS[@]}" agent@"$IP" bash -l -s -- "$BASE" "$BRANCH" "$ORIGIN" <<'REMOTE' 2>&1 | tee "$OUT/agent.log"
+  rsh bash -l -s -- "$BASE" "$BRANCH" "$ORIGIN" <<'SETUP'
 set -e
-. ~/.job-env
 git clone -q -b "$1" ~/in.bundle ~/work && cd ~/work
 git switch -q -c "$2"
 git remote remove origin
@@ -58,15 +73,69 @@ if [ -n "$3" ]; then
   git remote add origin "$3"                       # fetch-only, via the read-only token
   git remote set-url --push origin PUSH-DISABLED
 fi
-claude -p "$(cat ~/prompt.md)" --dangerously-skip-permissions || echo "claude exited with $?"
-git bundle create ~/out.bundle "$1..$2" 2>/dev/null || echo "No new commits."
-REMOTE
+SETUP
+}
 
-  if scp "${OPTS[@]}" agent@"$IP":out.bundle "$OUT/" 2>/dev/null; then
+wip_commit() {
+  rsh 'cd ~/work && git add -A && git commit -q -m "WIP: uncommitted changes at end of session"' &&
+    echo "Committed them as a WIP commit."
+}
+
+# collect: turn leftovers into a WIP commit, bundle new commits, fetch them into your repo.
+collect() {
+  local dirty answer
+  dirty="$(rsh 'cd ~/work 2>/dev/null && git status --porcelain' 2>/dev/null || true)"
+  if [ -n "$dirty" ]; then
+    echo; echo "Uncommitted changes in the VM:"; echo "$dirty"
+    if [ "$KIND" = session ] && [ -t 0 ]; then
+      read -rp "Keep them as a WIP commit? [Y/n] " answer || answer=y
+      case "$answer" in [Nn]*) echo "Discarding them." ;; *) wip_commit || true ;; esac
+    else
+      wip_commit || true
+    fi
+  fi
+
+  if rsh "cd ~/work && git bundle create -q ~/out.bundle '$BASE..$BRANCH'" 2>/dev/null &&
+     scp -q "${OPTS[@]}" agent@"$IP":out.bundle "$OUT/" 2>/dev/null; then
     git -C "$REPO" fetch -q "$OUT/out.bundle" "$BRANCH:$BRANCH"
     echo; echo "Commits are on $BRANCH. Review: git -C \"$REPO\" log --stat $BASE..$BRANCH"
+  else
+    echo; echo "No new commits."
   fi
-  echo "Logs and bundles: $OUT"
+}
+
+finish() {
+  local rc=$?
+  trap - EXIT INT TERM
+  [ -n "$IP" ] && { collect || echo "Could not collect commits from the VM." >&2; }
+  if [ -n "$VM" ]; then
+    tart stop "$VM" >/dev/null 2>&1 || true
+    tart delete "$VM" || true
+  fi
+  [ -n "$OUT" ] && echo "Logs and bundles: $OUT"
+  exit "$rc"
+}
+
+run_job() {  # <repo> <prompt-file> [branch]
+  [ -f "${2:-}" ] || { echo "Prompt file not found: ${2:-}" >&2; exit 1; }
+  local prompt="$2"
+  start_vm job "$1" "${3:-}"
+  cp "$prompt" "$OUT/prompt.md"
+  scp -q "${OPTS[@]}" "$OUT/prompt.md" agent@"$IP":
+  rsh bash -l -s <<'REMOTE' 2>&1 | tee "$OUT/agent.log"
+. ~/.job-env
+cd ~/work
+claude -p "$(cat ~/prompt.md)" --permission-mode auto || echo "claude exited with $?"
+REMOTE
+}
+
+run_session() {  # <repo> [branch]
+  start_vm session "$1" "${2:-}"
+  echo
+  echo "Claude Code is starting in the VM, in ~/work on $BRANCH."
+  echo "Quitting Claude leaves you in a shell there; exit that shell to end the session."
+  echo
+  ssh -t "${OPTS[@]}" agent@"$IP" "zsh -lc 'cd ~/work && . ~/.job-env && { claude; exec zsh -l; }'" || true
 }
 
 # ---------- dispatch ----------
@@ -82,6 +151,7 @@ case "${1:-}" in
     : "${PKR_VAR_admin_password:?export PKR_VAR_admin_password first}"
     build agent
     ;;
-  run) shift; run_job "$@" ;;
-  *) sed -n '2,4p' "$0"; exit 1 ;;
+  run)     shift; run_job "$@" ;;
+  session) shift; run_session "$@" ;;
+  *) sed -n '2,5p' "$0"; exit 1 ;;
 esac
