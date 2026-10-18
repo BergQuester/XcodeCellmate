@@ -27,6 +27,32 @@ variable "brew_packages" {
   default = ["gh", "jq", "xcbeautify"] # add tools here, then: ./agent.sh tools
 }
 
+variable "claude_deny_rules" {
+  type = list(string)
+  # Hard blocks for Claude Code in job VMs; apply in every permission mode.
+  # They match commands as written, so they're a backstop, not the only guard.
+  # Edit, then: ./agent.sh tools
+  default = [
+    "Bash(git push *)",
+    "Bash(git -C * push *)",
+    "Bash(git clone *)",
+    "Bash(git -C * clone *)",
+    "Bash(gh repo clone *)",
+    "Bash(gh repo fork *)",
+    "Bash(git submodule add *)",
+    # Web: Claude's own web tools plus common command-line HTTP clients.
+    "WebFetch",
+    "WebSearch",
+    "Bash(curl *)",
+    "Bash(wget *)",
+    # Outbound SSH (your Mac's SSH *into* the VM is unaffected).
+    "Bash(ssh *)",
+    "Bash(scp *)",
+    "Bash(sftp *)",
+    "Bash(rsync *)",
+  ]
+}
+
 variable "ssh_pubkey_path" {
   type    = string
   default = "~/.ssh/id_ed25519.pub" # your Mac's key; job VMs accept only this key for user "agent"
@@ -192,6 +218,23 @@ build {
       chmod +x ~/.git-hooks/pre-push
       git config --global core.hooksPath ~/.git-hooks
       GIT
+    EOT
+    ]
+  }
+
+  # Deny rules as Claude Code managed settings: highest precedence, and owned by
+  # root so the non-admin agent user can't edit or override them.
+  provisioner "shell" {
+    inline_shebang = "/bin/bash -e"
+    inline = [<<-EOT
+      DIR="/Library/Application Support/ClaudeCode"
+      sudo mkdir -p "$DIR"
+      printf '%s\n' '${jsonencode({ permissions = { deny = var.claude_deny_rules } })}' |
+        sudo tee "$DIR/managed-settings.json" >/dev/null
+      sudo chown root:wheel "$DIR/managed-settings.json"
+      sudo chmod 644 "$DIR/managed-settings.json"
+      echo "Claude Code managed settings:"
+      cat "$DIR/managed-settings.json"
     EOT
     ]
   }
