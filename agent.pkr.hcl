@@ -22,6 +22,17 @@ variable "base_image" {
   default = "ghcr.io/cirruslabs/macos-golden-gate-xcode:27" # macOS 27; pin @sha256 for reproducibility
 }
 
+variable "sdk_platforms" {
+  type = list(string)
+  # Simulator runtimes installed with Xcode. Each entry is one of:
+  #   "iOS"                 latest runtime of that platform for this Xcode
+  #   "watchOS 27.0"        a specific version (or build number, e.g. "iOS 24B5110a")
+  #   "iphonesimulator_22A3351.dmg"   a runtime image to import, placed next to the .xip
+  # Platforms: iOS, watchOS, tvOS, visionOS. Empty list = latest iOS.
+  # Overridden by extra arguments to: ./agent.sh xcode <xip> [platform ...]
+  default = []
+}
+
 variable "brew_packages" {
   type    = list(string)
   default = ["gh", "jq", "xcbeautify"] # add tools here, then: ./agent.sh tools
@@ -117,7 +128,10 @@ build {
 
   provisioner "shell" {
     inline_shebang   = "/bin/bash -e"
-    environment_vars = ["XIP=/Volumes/My Shared Files/xcode/${var.xcode_xip_name}"]
+    environment_vars = [
+      "XIP=/Volumes/My Shared Files/xcode/${var.xcode_xip_name}",
+      "SDK_PLATFORMS=${join(";", var.sdk_platforms)}",
+    ]
     inline = [<<-EOT
       set -o pipefail
       test -f "$XIP" || { echo "Not found: $XIP" >&2; exit 1; }
@@ -142,15 +156,41 @@ build {
       echo "Delete unneeded runtimes"
       xcrun simctl runtime delete all
 
-      # iOS SDK is inside Xcode; this adds the matching simulator runtime.
-      echo "Download iOS SDK"
-      xcodebuild -downloadPlatform iOS
+      # SDKs ship inside Xcode; these add the simulator runtimes you asked for
+      # (default: the latest iOS runtime for this Xcode).
+      SPECS="$SDK_PLATFORMS"
+      [ -n "$SPECS" ] || SPECS="iOS"
+      echo "$SPECS" | tr ';' '\n' | while read -r platform version; do
+        [ -n "$platform" ] || continue
+        case "$platform" in
+          *.dmg|*.DMG)
+            image="$(echo "$platform $version" | sed 's/ *$//')"
+            echo "Importing simulator runtime $image"
+            xcodebuild -importPlatform "/Volumes/My Shared Files/xcode/$image" </dev/null || exit 1
+            ;;
+          *)
+            if [ -z "$version" ]; then
+              echo "Downloading latest $platform simulator runtime"
+              xcodebuild -downloadPlatform "$platform" </dev/null || exit 1
+            else
+              echo "Downloading $platform $version simulator runtime"
+              # Some versions only download with an explicit architecture variant.
+              xcodebuild -downloadPlatform "$platform" -buildVersion "$version" </dev/null ||
+                xcodebuild -downloadPlatform "$platform" -buildVersion "$version" -architectureVariant arm64 </dev/null || {
+                  echo "Could not download $platform $version. Older runtimes may not be downloadable by this Xcode:" >&2
+                  echo "add it at the next pause (Xcode > Settings > Components), or import a .dmg instead." >&2
+                  exit 1
+                }
+            fi
+            ;;
+        esac
+      done
     EOT
     ]
   }
 
   provisioner "breakpoint" {
-    note = "In the VM window: Xcode > Settings > Components > download Documentation. Then press Enter here."
+    note = "In the VM window: Xcode > Settings > Components > download Documentation (and add any other platforms you want). Then press Enter here."
   }
 
   provisioner "shell" {

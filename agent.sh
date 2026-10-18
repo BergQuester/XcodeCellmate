@@ -1,4 +1,7 @@
 #!/bin/bash
+# ./agent.sh xcode <Xcode.xip> [platform ...]        new Xcode: rebuild xcode-base, then agent-base
+#   platform: iOS | watchOS | tvOS | visionOS, optionally with a version ("iOS 26.4"),
+#   or a runtime .dmg next to the .xip. Default: sdk_platforms in agent.pkr.hcl, else latest iOS.
 # ./agent.sh tools                                   new tools/rules: rebuild agent-base only
 # ./agent.sh run [--gui] <repo> <prompt-file> [branch]    unattended job in a throwaway VM
 # ./agent.sh session [--gui] <repo> [branch]              attended Claude Code session in a throwaway VM
@@ -160,8 +163,17 @@ run_session() {  # <repo> [branch]
 case "${1:-}" in
   xcode)
     : "${PKR_VAR_admin_password:?export PKR_VAR_admin_password first}"
+    [ -f "${2:-}" ] || { echo "Usage: $0 xcode <Xcode.xip> [platform ...]" >&2; exit 1; }
     XIP="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"
-    build xcode -var xcode_xip_dir="$(dirname "$XIP")" -var xcode_xip_name="$(basename "$XIP")"
+    shift 2
+    PLATFORM_ARGS=()
+    if [ $# -gt 0 ]; then          # e.g. iOS "iOS 26.4" watchOS  ->  sdk_platforms=["iOS","iOS 26.4","watchOS"]
+      list=""
+      for p in "$@"; do list="$list\"$p\","; done
+      PLATFORM_ARGS=(-var "sdk_platforms=[${list%,}]")
+    fi
+    build xcode -var xcode_xip_dir="$(dirname "$XIP")" -var xcode_xip_name="$(basename "$XIP")" \
+      ${PLATFORM_ARGS[@]+"${PLATFORM_ARGS[@]}"}
     build agent
     ;;
   tools)
@@ -173,5 +185,5 @@ case "${1:-}" in
     if [ "${1:-}" = --gui ]; then GUI=1; shift; fi
     if [ "$cmd" = run ]; then run_job "$@"; else run_session "$@"; fi
     ;;
-  *) sed -n '2,6p' "$0"; exit 1 ;;
+  *) sed -n '2,8p' "$0"; exit 1 ;;
 esac
