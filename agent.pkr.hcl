@@ -515,6 +515,31 @@ build {
       sudo sysadminctl -addUser agent -fullName "Claude Agent" -password "$AGENT_PW" -home /Users/agent
       sudo createhomedir -c -u agent >/dev/null
 
+      # Skip macOS's first-login Setup Assistant for agent. Start from admin's answers (the
+      # base image already skipped it for admin), then mark every known screen as seen for
+      # this macOS version, since a newer version shows the screens it adds again.
+      if defaults export com.apple.SetupAssistant - > /tmp/setupassistant.plist 2>/dev/null; then
+        sudo -u agent defaults import com.apple.SetupAssistant /tmp/setupassistant.plist
+      fi
+      rm -f /tmp/setupassistant.plist
+      os_ver="$(sw_vers -productVersion)"; os_build="$(sw_vers -buildVersion)"
+      sa() { sudo -u agent defaults write com.apple.SetupAssistant "$@"; }
+      for k in Accessibility ActivationLock AppearanceSetup ApplePaySetup AvatarSetup CloudSetup \
+               iCloudLoginForStorageServices Intelligence LockdownMode Privacy ScreenTime SiriSetup \
+               SyncSetup SyncSetup2 TermsOfAddress TouchIDSetup TrueTonePrivacy Wallpaper; do
+        sa "DidSee$k" -bool true
+      done
+      for k in LastSeenCloudProductVersion LastSeenDiagnosticsProductVersion LastSeenSiriProductVersion \
+               LastSeenIntelligenceProductVersion LastPreLoginTasksPerformedVersion; do
+        sa "$k" "$os_ver"
+      done
+      sa LastSeenBuddyBuildVersion "$os_build"
+      sa LastPreLoginTasksPerformedBuild "$os_build"
+      sa GestureMovieSeen none
+      sa SkipFirstLoginOptimization -bool true
+      sa MiniBuddyShouldLaunchToResumeSetup -bool false
+      sudo -u agent defaults write com.apple.assistant.support "Assistant Enabled" -bool false   # Siri off
+
       # Log in as agent at boot, so the VM window (agent.sh --gui) shows agent's
       # desktop and the Simulator it launches, and simulator/UI tests have a GUI session.
       sudo sysadminctl -autologin set -userName agent -password "$AGENT_PW"
@@ -551,14 +576,16 @@ build {
       # Claude Code for the agent user only.
       sudo -u agent -H bash -lc 'curl -fsSL https://claude.ai/install.sh | bash'
 
-      # Skip Claude Code's first-run screens (theme picker, onboarding, release notes) in sessions.
+      # Skip Claude Code's first-run screens (theme picker, onboarding, release notes) in sessions,
+      # and trust ~/work, the only folder sessions run in (jobs with -p never ask).
       sudo -u agent -H bash -l <<'CLAUDECFG'
       set -e
       v="$(claude --version | cut -d' ' -f1)"
       f=~/.claude.json
       [ -s "$f" ] || echo '{}' > "$f"
       jq --arg v "$v" --arg theme "${var.claude_theme}" \
-        '.theme = $theme | .hasCompletedOnboarding = true | .lastOnboardingVersion = $v | .lastReleaseNotesSeen = $v' \
+        '.theme = $theme | .hasCompletedOnboarding = true | .lastOnboardingVersion = $v | .lastReleaseNotesSeen = $v
+         | .projects["/Users/agent/work"] += {hasTrustDialogAccepted: true, hasCompletedProjectOnboarding: true}' \
         "$f" > "$f.tmp" && mv "$f.tmp" "$f"
       chmod 600 "$f"
       echo "Claude Code $v: theme $(jq -r .theme "$f"), onboarding skipped"

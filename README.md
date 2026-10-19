@@ -291,7 +291,7 @@ Things to know:
 - **Runs count against your plan's usage limits**, shared with your normal Claude use. Long unattended jobs can use a lot; if you hit a limit mid-job, the job stops making progress until the limit resets.
 - **Auto mode** (used by `agent.sh run`) is available on Max, Team and Enterprise, but not on every plan or model; if a job's log shows nearly every command denied, auto mode wasn't available (see [§14](#14-troubleshooting)).
 - **Treat the token like a password for your subscription.** Anyone who gets it can use your plan for a year. It's exposed inside the VM during runs, so the protections in [§13](#13-security-model-and-its-limits) apply to it too. If it leaks, look in your Claude account settings for a way to revoke it (or contact support), and generate a new one.
-- In an attended session, Claude Code skips its first-run theme picker and onboarding: the image presets them (`claude_theme` in `agent.pkr.hcl`). It may still ask whether you trust the folder.
+- In an attended session, Claude Code skips its first-run theme picker, onboarding and folder-trust prompt: the image presets them (`claude_theme` in `agent.pkr.hcl`) and trusts `~/work`. Trusting it means the project's own `.claude/` settings, including hooks, apply without asking, as they already do in unattended jobs. The deny rules in managed settings still take precedence.
 
 ### Claude: API key (pay per token)
 
