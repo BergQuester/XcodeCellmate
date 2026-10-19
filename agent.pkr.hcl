@@ -460,12 +460,29 @@ build {
       # Log in as agent at boot, so the VM window (agent.sh --gui) shows agent's
       # desktop and the Simulator it launches, and simulator/UI tests have a GUI session.
       sudo sysadminctl -autologin set -userName agent -password "$AGENT_PW"
+      # sysadminctl can leave the base image's /etc/kcpassword (admin's) in place, and the VM
+      # then stops at the login screen. Write agent's ourselves: the password plus a NUL, padded
+      # to a multiple of 12 bytes, XORed with Apple's fixed key.
+      sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser agent
+      perl -e '@k = (125,137,82,35,210,188,221,234,163,185,31); $p = $ARGV[0] . "\0"; $p .= "\0" x ((12 - length($p) % 12) % 12); $i = 0; print join "", map { chr(ord($_) ^ $k[$i++ % 11]) } split //, $p' "$AGENT_PW" |
+        sudo tee /etc/kcpassword >/dev/null
+      sudo chown root:wheel /etc/kcpassword
+      sudo chmod 600 /etc/kcpassword
 
       # Key-only SSH login from your Mac.
       sudo -u agent mkdir -p /Users/agent/.ssh
       echo "$AGENT_SSH_PUBKEY" | sudo -u agent tee /Users/agent/.ssh/authorized_keys >/dev/null
       sudo chmod 700 /Users/agent/.ssh
       sudo chmod 600 /Users/agent/.ssh/authorized_keys
+
+      # Base images may limit Remote Login to Administrators (the com.apple.access_ssh group
+      # exists); sshd then accepts agent's key and drops the connection. Allow agent too.
+      # Without the group, every user may SSH in; don't create it, as that would lock out admin.
+      if dscl . -read /Groups/com.apple.access_ssh >/dev/null 2>&1; then
+        sudo dseditgroup -o edit -a agent -t user com.apple.access_ssh
+        dsmemberutil checkmembership -U agent -G com.apple.access_ssh | grep -q 'is a member' ||
+          { echo "agent is not allowed to use SSH (com.apple.access_ssh)" >&2; exit 1; }
+      fi
 
       # PATH for Homebrew tools and Claude Code (zsh and bash login shells).
       for f in .zprofile .bash_profile; do
