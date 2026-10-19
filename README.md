@@ -135,6 +135,17 @@ ls -l "$SOFTNET"    # should show -rwsr-xr-x  root  wheel
 
 If you want to get going without it, remove `--net-softnet` from the `tart run` line in `boot_vm()` in `agent.sh` and the check in `start_vm()` (and accept that the VM can then reach your LAN).
 
+### Shorter DHCP leases
+
+VMs started without Softnet (image builds, and any VM you `tart run` yourself) get their address from macOS's DHCP server, which leases each address for a day by default. Every new VM has a new MAC address and takes a new lease, so many short-lived VMs can use up the pool, and new VMs then never get an IP. Shorten the lease to 10 minutes:
+
+```sh
+sudo defaults write /Library/Preferences/SystemConfiguration/com.apple.InternetSharing.default.plist bootpd -dict-add DHCPLeaseTimeSecs -int 600
+defaults read /Library/Preferences/SystemConfiguration/com.apple.InternetSharing.default.plist bootpd   # check
+```
+
+It applies to leases handed out after the change. Existing leases are in `/var/db/dhcpd_leases`. Softnet VMs (jobs and sessions) don't seem to take leases from this pool.
+
 ### Apple's `container` tool
 
 If you also use Apple's `container` CLI, stop its service while using Tart (`container system stop`); both use the same virtual networking and can interfere.
@@ -280,7 +291,7 @@ Things to know:
 - **Runs count against your plan's usage limits**, shared with your normal Claude use. Long unattended jobs can use a lot; if you hit a limit mid-job, the job stops making progress until the limit resets.
 - **Auto mode** (used by `agent.sh run`) is available on Max, Team and Enterprise, but not on every plan or model; if a job's log shows nearly every command denied, auto mode wasn't available (see [§14](#14-troubleshooting)).
 - **Treat the token like a password for your subscription.** Anyone who gets it can use your plan for a year. It's exposed inside the VM during runs, so the protections in [§13](#13-security-model-and-its-limits) apply to it too. If it leaks, look in your Claude account settings for a way to revoke it (or contact support), and generate a new one.
-- In an attended session, Claude Code may show its first-run setup screens (theme and so on) because each VM is fresh. Click through them.
+- In an attended session, Claude Code skips its first-run theme picker and onboarding: the image presets them (`claude_theme` in `agent.pkr.hcl`). It may still ask whether you trust the folder.
 
 ### Claude: API key (pay per token)
 
@@ -841,6 +852,7 @@ Then check the firewall's monitor and `/opt/homebrew/var/log/tinyproxy/tinyproxy
 | A job's log shows nearly every command denied | Auto mode wasn't available, so the session started in Manual mode, which denies everything that would prompt in `-p` runs. Check the Claude Code version and auto mode requirements in the [permission modes docs](https://code.claude.com/docs/en/permission-modes). |
 | `Softnet (--net-softnet) must run as root`, or the VM window appears and closes at once | Softnet isn't SUID root ([§3](#softnet-network-isolation-for-runs)); run the commands `agent.sh` prints. If a VM fails to boot for another reason, `agent.sh` prints its `tart.log` and stops. |
 | `The VM stopped unexpectedly` at the end of a run | The VM window was closed or the VM crashed. `agent.sh` restarts it without a window to collect the commits; if that fails it keeps the VM and prints how to recover the work. |
+| A VM started without Softnet never gets an IP (`tart ip` fails) | The DHCP pool may be full of day-long leases from earlier VMs; shorten the lease ([§3](#shorter-dhcp-leases)) and wait for old ones to expire. |
 | Can't start a VM: limit reached | Only two macOS VMs can run at once. `tart list` shows running ones; `tart stop <name>`. |
 | macOS setup screens in the `--gui` window | First login of the `agent` account in each fresh clone. Harmless for Claude. Getting past them once in the image needs an extra build step. |
 | `BLOCKED: the agent's commits change files that define its own limits` | Intended: see [§11](#11-review-and-integrate-the-results). The work is on `agent-quarantine/<run>`. |
