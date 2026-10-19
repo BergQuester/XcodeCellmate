@@ -567,6 +567,8 @@ Claude Code is installed when the agent layer is built. Rebuild periodically (`.
 | **Auto mode** | A classifier reviews risky actions before they run, including sending data to external endpoints and download-and-execute, and isn't influenced by the contents of files and pages Claude reads. |
 | **Softnet** | The VM reaching your local network. |
 | **`CLAUDE.md` rules** | Steering Claude (and the classifier) away from pushing, cloning, web/SSH, build-script and dependency changes. |
+| **Quarantine of limit-file changes** (in `agent.sh`) | Commits that touch `CLAUDE.md`, `AGENTS.md`, `.claude/`, `.mcp.json` or other agents' instruction files are put on `agent-quarantine/<run>` instead of `agent/<run>`, even if made through the shell. |
+| **Audit log** (hook in managed settings, captured live by `agent.sh`) | Unnoticed denials, failures and workaround attempts: every tool call is recorded where the agent can't rewrite what's already captured ([§11.7](#117-review-denied-and-failed-commands-and-tune-the-rules)). |
 | **Your review** before building on your Mac | Malicious or broken code, build scripts, dependencies, signing changes. |
 
 ### What's still exposed
@@ -577,6 +579,159 @@ Claude Code is installed when the agent layer is built. Rebuild periodically (`.
 - **Network-level filtering isn't set up by default.** See [Optional: allowlist network access from your Mac](#optional-allowlist-network-access-from-your-mac) for enforcing it on your Mac with a proxy and a host firewall.
 - **`xcode-base` keeps the default `admin`/`admin` password.** It never runs jobs and stays on your Mac, but don't share or push it to a registry.
 - **Xcode betas** are pre-release software running agent-written code; that's another reason the review step matters.
+
+### Optional: allowlist network access from your Mac
+
+Everything above still lets the VM reach the whole internet; it only makes it hard for the agent to *try*. This section describes how to enforce, on your Mac, that a VM can reach only Claude and GitHub, using a host firewall such as [Little Snitch](https://www.obdev.at/products/littlesnitch/) or [LuLu](https://objective-see.org/products/lulu.html). It's a manual setup: `agent.sh` doesn't configure it for you.
+
+#### Why the firewall can't simply watch the VM
+
+Little Snitch and LuLu are *application* firewalls: they filter connections made by processes on your Mac, through Apple's Network Extension framework. A Tart VM's traffic isn't made by a process. It leaves through Apple's virtual network (vmnet), which forwards and translates the VM's packets below the level these firewalls see. Reports from other VM products match this: Little Snitch saw guest traffic only when a user-space helper process did the NAT (Parallels' `prl_naptd`, VMware in NAT mode), and not in bridged mode.
+
+So expect your firewall **not** to see Tart VM traffic at all. Check on your own Mac before relying on anything (see *Test it*, below): if Little Snitch does show the VM's connections under some process, you can write rules for that process directly and skip the proxy.
+
+#### The design: a proxy on your Mac, filtered by the firewall
+
+Give the firewall a process to watch:
+
+```
+VM (Claude Code, git, gh) ──HTTPS_PROXY──► proxy on your Mac ──► internet
+         │                                   ▲
+         └─ Softnet: everything else blocked │ Little Snitch / LuLu: proxy may only
+            (only the proxy is reachable)    │ reach api.anthropic.com, github.com, …
+```
+
+1. A small HTTP proxy runs on your Mac (this guide uses [tinyproxy](https://tinyproxy.github.io/)).
+2. Inside the VM, Claude Code, `git` and `gh` are told to use it. All three honour `HTTPS_PROXY`; git over SSH is tunnelled through it too.
+3. Softnet blocks the VM from everything except the proxy, so tools that ignore the proxy simply fail (fail closed).
+4. Little Snitch (or LuLu) has rules for the proxy process: allowed to reach only the listed domains, denied everything else. Its monitor shows every connection each run made, by domain name.
+
+The proxy's own host filter is a second layer, so the allowlist doesn't depend on a single tool.
+
+#### What to allow
+
+| Domain | Port | Used by |
+| --- | --- | --- |
+| `api.anthropic.com` | 443 | Claude Code (API key or subscription token), including auto mode's classifier |
+| `github.com` | 443 | git over HTTPS, Swift packages |
+| `ssh.github.com` | 443 | git over SSH, tunnelled through the proxy |
+| `api.github.com` | 443 | `gh` (reading issues and PRs) |
+| `codeload.github.com` | 443 | Swift package archives |
+| `objects.githubusercontent.com` | 443 | release assets, some package downloads (add if fetches fail) |
+
+Start with this list and watch the firewall's log on the first runs: a blocked connection shows exactly which name to add. Anthropic also publishes the fixed address range its API receives connections on (`160.79.104.0/23`, see [IP addresses](https://docs.anthropic.com/en/api/ip-addresses)) if you'd rather allow it by address.
+
+#### Step 1: install and configure the proxy
+
+```sh
+brew install tinyproxy
+```
+
+Find the address of your Mac on the VM network: start any VM, then on your Mac run `ifconfig | grep -A3 bridge1`. The `inet` address (for example `192.168.64.1` or `192.168.65.1`) is the gateway VMs see. The bridge only exists while a VM runs, so the proxy listens on all addresses but only accepts clients from the VM range.
+
+Create `/opt/homebrew/etc/tinyproxy/allowed-hosts` with one pattern per line:
+
+```
+^api\.anthropic\.com$
+^github\.com$
+^ssh\.github\.com$
+^api\.github\.com$
+^codeload\.github\.com$
+^objects\.githubusercontent\.com$
+```
+
+Edit `/opt/homebrew/etc/tinyproxy/tinyproxy.conf` so it contains (keep the file's other defaults):
+
+```
+Port 8888
+Listen 0.0.0.0
+Allow 192.168.64.0/22          # Tart/vmnet VM addresses only
+ConnectPort 443                # HTTPS and SSH-over-443 only
+Filter "/opt/homebrew/etc/tinyproxy/allowed-hosts"
+FilterType ere
+FilterDefaultDeny Yes          # anything not listed is refused
+LogLevel Connect
+```
+
+Start it, and check it's listening:
+
+```sh
+brew services start tinyproxy
+lsof -nP -iTCP:8888 -sTCP:LISTEN
+```
+
+Check the directive names against `man tinyproxy.conf` for your version; option names have changed between releases.
+
+#### Step 2: firewall rules for the proxy
+
+**Little Snitch:** create a rule group (for example "Agent VM proxy") with:
+
+- **Allow** outgoing connections from `/opt/homebrew/opt/tinyproxy/bin/tinyproxy` (check the path with `brew --prefix tinyproxy`) to each domain in the table, port 443.
+- **Deny** outgoing connections from the same process to any other destination.
+
+Little Snitch evaluates more specific rules first, so the per-domain allows win over the catch-all deny. Then open the Network Monitor and filter on `tinyproxy` to watch runs.
+
+**LuLu:** add the tinyproxy binary with *Block* as the default, then allow rules for each domain on port 443.
+
+#### Step 3: point the VM at the proxy
+
+These lines go in the VM's job environment. In `agent.sh`, add them to the `printf` that writes `~/.job-env` (replace `192.168.64.1` with your gateway address):
+
+```sh
+export HTTPS_PROXY=http://192.168.64.1:8888
+export HTTP_PROXY=http://192.168.64.1:8888
+export NO_PROXY=localhost,127.0.0.1
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1   # no telemetry or error reporting
+export DISABLE_AUTOUPDATER=1                        # no update checks
+```
+
+`gh` and Claude Code read `HTTPS_PROXY`; so does git for HTTPS remotes. For git over SSH, add this to the image (in the `agent` build's git setup), which sends SSH to GitHub through the proxy on port 443:
+
+```
+# /Users/agent/.ssh/config
+Host github.com
+  HostName ssh.github.com
+  Port 443
+  ProxyCommand /usr/bin/nc -X connect -x 192.168.64.1:8888 %h %p
+```
+
+(The deny rule on `nc` only applies to commands Claude types; ssh launching it as a proxy command is unaffected.)
+
+#### Step 4: block everything else with Softnet
+
+Change the two `tart run` lines in `agent.sh` so the VM can reach only your Mac's gateway address:
+
+```sh
+tart run --no-graphics --net-softnet \
+  --net-softnet-block 0.0.0.0/0 --net-softnet-allow 192.168.64.1/32 "$VM"
+```
+
+How Softnet combines overlapping block and allow lists isn't documented, so this is the step to verify most carefully (next section). Allowing your Mac's address also allows any *other* service listening on it, so check `lsof -nP -iTCP -sTCP:LISTEN` for services bound to all interfaces, and turn on the macOS firewall's incoming protection for them.
+
+Also consider turning off IPv6 in the image (`networksetup -setv6off Ethernet` in the `agent` build) so nothing slips past over IPv6.
+
+#### Test it
+
+Open a session (`./agent.sh session ~/src/MyApp`), quit Claude to get the shell, and run (you're typing these, so Claude's deny rules don't apply):
+
+```sh
+curl -sI https://api.anthropic.com | head -1          # works (any HTTP status)
+gh issue list --limit 1                               # works
+git ls-remote origin | head -1                        # works
+ssh -T git@github.com                                  # reaches GitHub (auth may fail without a key)
+curl -sI --max-time 10 https://example.com            # FAILS: refused by the proxy
+curl -sI --max-time 10 --noproxy '*' https://example.com   # FAILS: blocked by Softnet
+curl -sI --max-time 10 https://1.1.1.1                # FAILS: blocked by Softnet
+```
+
+Then check the firewall's monitor and `/opt/homebrew/var/log/tinyproxy/tinyproxy.log` on your Mac: you should see the allowed connections and the refusals. If the `--noproxy` and IP tests succeed, Softnet isn't blocking direct traffic and the setup isn't enforcing anything yet.
+
+#### Limits
+
+- **It filters by name, not content.** Anything sent to an allowed host still gets through. A compromised agent could still send data to, for example, a GitHub repository it can write to (the read-only token prevents that for yours) or to the Anthropic API.
+- **Builds that fetch from other hosts fail** (a Swift package hosted outside GitHub, a build script downloading something). That's failing closed; add the host to both the proxy filter and the firewall rules if it's legitimate.
+- **Image builds aren't affected.** Packer's build VMs don't use Softnet or the proxy, so Xcode, runtime and Homebrew downloads keep working.
+- **The firewall sees only the proxy.** If your checks show Little Snitch can't see VM traffic directly, Softnet is what stops the VM bypassing the proxy, so the Softnet test above is essential.
 
 ---
 
