@@ -173,6 +173,7 @@ All the settings you're expected to change are at the top of `agent.pkr.hcl`, un
 | `base_image` | `ghcr.io/cirruslabs/macos-golden-gate-xcode:27` | The starting image. Pin it by digest (`…@sha256:…`) for reproducible builds; see [§12](#12-maintenance). |
 | `sdk_platforms` | empty (= latest iOS) | Simulator runtimes installed with Xcode; see [§6.4](#64-choose-sdk-platforms-and-versions). Can be overridden per build on the command line. |
 | `brew_packages` | `gh`, `jq`, `xcbeautify` | Homebrew packages installed in the agent layer. |
+| `claude_theme` | `auto` | Claude Code theme preset for the `agent` user, so sessions skip the first-run theme picker. |
 | `brew_keep` | `tart-guest-agent`, `swiftlint` | Base-image Homebrew packages to keep. The agent layer removes every other formula and cask the Cirrus Labs image preinstalled (CI runners, other AI agents such as Codex, language and version managers, device tools), then the third-party taps nothing left uses. Add a package here if your projects need it. |
 | `claude_deny_rules` | git/`gh` writes, web and network tools, nested `claude`, signing, `sudo`, Homebrew, version and package managers | Claude Code deny rules, written to root-owned managed settings, grouped by category. Remove the `pod`/`bundle`/`npm` rules if a project needs them. See [§13](#13-security-model-and-its-limits). |
 | `ssh_pubkey_path` | `~/.ssh/id_ed25519.pub` | The only key that can log in to job VMs as `agent`. |

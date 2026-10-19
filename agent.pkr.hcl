@@ -38,6 +38,13 @@ variable "brew_packages" {
   default = ["gh", "jq", "xcbeautify"] # add tools here, then: ./agent.sh tools
 }
 
+variable "claude_theme" {
+  type = string
+  # Preset so attended sessions skip Claude Code's first-run theme picker.
+  # auto, dark, light, dark-daltonized, light-daltonized, dark-ansi or light-ansi.
+  default = "auto"
+}
+
 variable "brew_keep" {
   type = list(string)
   # Packages the base image installed that jobs use. The agent build removes every other
@@ -543,6 +550,19 @@ build {
 
       # Claude Code for the agent user only.
       sudo -u agent -H bash -lc 'curl -fsSL https://claude.ai/install.sh | bash'
+
+      # Skip Claude Code's first-run screens (theme picker, onboarding, release notes) in sessions.
+      sudo -u agent -H bash -l <<'CLAUDECFG'
+      set -e
+      v="$(claude --version | cut -d' ' -f1)"
+      f=~/.claude.json
+      [ -s "$f" ] || echo '{}' > "$f"
+      jq --arg v "$v" --arg theme "${var.claude_theme}" \
+        '.theme = $theme | .hasCompletedOnboarding = true | .lastOnboardingVersion = $v | .lastReleaseNotesSeen = $v' \
+        "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+      chmod 600 "$f"
+      echo "Claude Code $v: theme $(jq -r .theme "$f"), onboarding skipped"
+      CLAUDECFG
 
       # Git: identity, GitHub auth from $GH_TOKEN (set per job), push backstop.
       sudo -u agent -H bash <<'GIT'
