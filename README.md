@@ -173,6 +173,7 @@ All the settings you're expected to change are at the top of `agent.pkr.hcl`, un
 | `base_image` | `ghcr.io/cirruslabs/macos-golden-gate-xcode:27` | The starting image. Pin it by digest (`…@sha256:…`) for reproducible builds; see [§12](#12-maintenance). |
 | `sdk_platforms` | empty (= latest iOS) | Simulator runtimes installed with Xcode; see [§6.4](#64-choose-sdk-platforms-and-versions). Can be overridden per build on the command line. |
 | `brew_packages` | `gh`, `jq`, `xcbeautify` | Homebrew packages installed in the agent layer. |
+| `brew_keep` | `tart-guest-agent`, `swiftlint` | Base-image Homebrew packages to keep. The agent layer removes every other formula and cask the Cirrus Labs image preinstalled (CI runners, other AI agents such as Codex, language and version managers, device tools), then the third-party taps nothing left uses. Add a package here if your projects need it. |
 | `claude_deny_rules` | git/`gh` writes, web and network tools, nested `claude`, signing, `sudo`, Homebrew, version and package managers | Claude Code deny rules, written to root-owned managed settings, grouped by category. Remove the `pod`/`bundle`/`npm` rules if a project needs them. See [§13](#13-security-model-and-its-limits). |
 | `ssh_pubkey_path` | `~/.ssh/id_ed25519.pub` | The only key that can log in to job VMs as `agent`. |
 
@@ -215,7 +216,7 @@ What happens:
 5. **Documentation (manual step).** Packer pauses with a note. In the VM window, open Xcode. If its *Components* sheet appears, click **Download & Install** (iOS is already installed, so it should finish quickly). Then open **Xcode → Settings → Components** and download **Documentation** if it's offered. Quit Xcode, return to the Terminal, and press **Enter**.
 6. **Checks.** The Xcode version, iOS SDK version and installed runtimes are printed. Confirm they're what you expect.
 7. **Swap.** `xcode-base-next` replaces `xcode-base`.
-8. **Agent layer** (a few minutes, automatic): Homebrew packages, the non-admin `agent` user with your SSH key and automatic login, Claude Code, git identity and push backstop, Claude Code deny rules (printed as JSON so you can check them), Xcode's MCP server for Claude (headless, printed with its status; see [§8.5](#85-xcode-mcp-tools)), and finally the admin password change. `agent-base-next` then replaces `agent-base`.
+8. **Agent layer** (a few minutes, automatic): Homebrew packages (installing `brew_packages`, then removing the base image's packages not in `brew_keep`; the log lists what was removed and what's left), the non-admin `agent` user with your SSH key and automatic login, Claude Code, git identity and push backstop, Claude Code deny rules (printed as JSON so you can check them), Xcode's MCP server for Claude (headless, printed with its status; see [§8.5](#85-xcode-mcp-tools)), and finally the admin password change. `agent-base-next` then replaces `agent-base`.
 
 Confirm the result:
 
@@ -586,7 +587,7 @@ Commands are kept complete. The only change is that the exact values of the Clau
 
 - A rule that keeps blocking legitimate work: remove or narrow it in `claude_deny_rules` in `agent.pkr.hcl`, then `./agent.sh tools`.
 - A workaround chain: add rules for the routes it tried, and consider a line in your `CLAUDE.md` explaining the expected way to do that task.
-- Repeated failures of the same command (a missing tool, a wrong simulator name): fix the environment (`brew_packages`, `sdk_platforms`) or your project's `CLAUDE.md` instructions.
+- Repeated failures of the same command (a missing tool, a wrong simulator name): fix the environment (`brew_packages`, `brew_keep`, `sdk_platforms`) or your project's `CLAUDE.md` instructions.
 
 The matching rule is found by applying your current `claude_deny_rules` to the recorded command, so if you change the rules later, older reports keep the rule names from when they were generated. Calls made by the build itself (build phases, package plugins) aren't tool calls and aren't recorded.
 
@@ -596,7 +597,7 @@ The matching rule is found by applying your current `claude_deny_rules` to the r
 
 ### Add a tool or change deny rules
 
-Edit `brew_packages` or `claude_deny_rules` in `agent.pkr.hcl`, then:
+Edit `brew_packages`, `brew_keep` or `claude_deny_rules` in `agent.pkr.hcl`, then:
 
 ```sh
 read -rs PKR_VAR_admin_password && export PKR_VAR_admin_password

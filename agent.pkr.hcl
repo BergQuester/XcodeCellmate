@@ -38,6 +38,18 @@ variable "brew_packages" {
   default = ["gh", "jq", "xcbeautify"] # add tools here, then: ./agent.sh tools
 }
 
+variable "brew_keep" {
+  type = list(string)
+  # Packages the base image installed that jobs use. The agent build removes every other
+  # formula and cask the base image installed (CI runners, other AI agents, language and
+  # version managers, device tools), plus dependencies nothing else needs.
+  # brew_packages are always kept.
+  default = [
+    "tart-guest-agent", # Tart's in-VM helper (tart exec, clipboard)
+    "swiftlint",        # projects with a .swiftlint.yml
+  ]
+}
+
 variable "claude_deny_rules" {
   type = list(string)
   # Hard blocks for Claude Code in job VMs; apply in every permission mode.
@@ -439,10 +451,49 @@ build {
     inline           = ["[ -n \"$NEW_ADMIN_PW\" ] || { echo 'admin_password not set' >&2; exit 1; }"]
   }
 
+  # Remove the base image's Homebrew packages that aren't in brew_keep or brew_packages.
+  # Runs before anything that updates, upgrades or installs, so Homebrew never spends time
+  # on packages that are about to go.
   provisioner "shell" {
+    inline_shebang = "/bin/bash -e"
+    inline = [<<-EOT
+      eval "$(/opt/homebrew/bin/brew shellenv)"
+      export HOMEBREW_NO_AUTO_UPDATE=1
+      keep=" ${join(" ", concat(var.brew_keep, var.brew_packages))} "
+      unwanted() { while read -r p; do case "$keep" in *" $p "*) ;; *) echo "$p" ;; esac; done; }
+
+      casks="$(brew list --cask -1 | unwanted)"
+      # Formulae installed on request (not just as dependencies), from Homebrew's install receipts.
+      formulae="$(for r in "$(brew --cellar)"/*/*/INSTALL_RECEIPT.json; do
+          grep -Eq '"installed_on_request"[[:space:]]*:[[:space:]]*true' "$r" && basename "$(dirname "$(dirname "$r")")"
+        done | sort -u | unwanted)"
+
+      echo "Removing casks:" $casks
+      [ -z "$casks" ] || brew uninstall --cask --force $casks
+      echo "Removing formulae:" $formulae
+      [ -z "$formulae" ] || brew uninstall --formula --ignore-dependencies $formulae
+      brew autoremove
+
+      # Third-party taps the base image added. brew untap refuses a tap that kept packages
+      # still come from (e.g. tart-guest-agent's), so only now-unused taps go.
+      for t in $(brew tap); do
+        case "$t" in homebrew/*) continue ;; esac
+        if brew untap "$t" >/dev/null 2>&1; then echo "Removed tap $t"; else echo "Kept tap $t (installed packages use it)"; fi
+      done
+      brew cleanup --prune=all -s >/dev/null || true
+
+      # --ignore-dependencies must not have taken anything a kept package needs.
+      brew missing || { echo "A kept Homebrew package lost a dependency (see above)" >&2; exit 1; }
+    EOT
+    ]
+  }
+
+  provisioner "shell" {
+    environment_vars = ["HOMEBREW_NO_UPDATE_REPORT_NEW=1", "HOMEBREW_NO_ENV_HINTS=1"]
     inline = [
       "eval \"$(/opt/homebrew/bin/brew shellenv)\"",
       "brew install ${join(" ", var.brew_packages)}",
+      "echo \"Homebrew packages left:\" $(brew leaves --installed-on-request) $(brew list --cask -1)",
     ]
   }
 
