@@ -299,6 +299,19 @@ variable "admin_password" {
 
 locals {
   agent_password = uuidv4() # agent logs in by key only; this just needs to be unguessable
+
+  # Audit hook: every tool call, its result, failures and denials are appended to
+  # ~/.agent-audit/events.jsonl, which agent.sh captures live on your Mac.
+  audit_hook = [{ matcher = "*", hooks = [{ type = "command", command = "/usr/local/libexec/agent-audit" }] }]
+  managed_settings = {
+    permissions = { deny = var.claude_deny_rules }
+    hooks = {
+      PreToolUse         = local.audit_hook
+      PostToolUse        = local.audit_hook
+      PostToolUseFailure = local.audit_hook
+      PermissionDenied   = local.audit_hook
+    }
+  }
 }
 
 # ---------- sources ----------
@@ -471,14 +484,29 @@ build {
     ]
   }
 
-  # Deny rules as Claude Code managed settings: highest precedence, and owned by
-  # root so the non-admin agent user can't edit or override them.
+  # Deny rules and audit hooks as Claude Code managed settings: highest precedence, and
+  # owned by root so the non-admin agent user can't edit, remove or override them.
   provisioner "shell" {
     inline_shebang = "/bin/bash -e"
     inline = [<<-EOT
+      # Audit hook script (root-owned; runs as agent for every hook event).
+      sudo mkdir -p /usr/local/libexec
+      sudo tee /usr/local/libexec/agent-audit >/dev/null <<'AUDIT'
+      #!/bin/bash
+      # Claude Code hook: append the hook's JSON input, with a timestamp, as one line.
+      dir="$HOME/.agent-audit"
+      mkdir -p "$dir" 2>/dev/null
+      input="$(cat | tr -d '\n')"
+      [ -n "$input" ] || input='{}'
+      printf '{"ts":"%s","event":%s}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$input" >> "$dir/events.jsonl"
+      exit 0
+      AUDIT
+      sudo chown root:wheel /usr/local/libexec/agent-audit
+      sudo chmod 755 /usr/local/libexec/agent-audit
+
       DIR="/Library/Application Support/ClaudeCode"
       sudo mkdir -p "$DIR"
-      printf '%s\n' '${jsonencode({ permissions = { deny = var.claude_deny_rules } })}' |
+      printf '%s\n' '${jsonencode(local.managed_settings)}' |
         sudo tee "$DIR/managed-settings.json" >/dev/null
       sudo chown root:wheel "$DIR/managed-settings.json"
       sudo chmod 644 "$DIR/managed-settings.json"

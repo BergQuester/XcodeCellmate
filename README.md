@@ -392,12 +392,15 @@ Pressing **Ctrl-C** also goes through step 5, so work committed so far is kept.
 
 ### 9.4 Watching and output
 
-`claude -p` mostly prints its final summary at the end, so the Terminal looks idle for a long time while it works. Everything is saved in `~/agent-jobs/job-…/`:
+Jobs run with `--output-format stream-json`, so the Terminal shows Claude's messages and each tool call as they happen. Everything is saved in `~/agent-jobs/job-…/`:
 
 | File | Contents |
 | --- | --- |
 | `prompt.md` | The prompt it ran with. |
-| `agent.log` | Claude's output, ending with its summary. |
+| `agent.log` | A readable log: Claude's messages, each tool call (`→`), errors (`✗`), and the final summary. |
+| `events.stream.jsonl` | Claude Code's raw event stream for the job (`--output-format stream-json`). |
+| `audit.jsonl` | Every tool call and result, captured live from the VM's audit hook. |
+| `denials.md` / `calls.json` | The denied and failed calls report ([§11.7](#117-review-denied-and-failed-commands-and-tune-the-rules)) and its data. |
 | `in.bundle` / `out.bundle` | What went in and what came out. |
 | `tart.log` | The VM's own log. |
 
@@ -414,7 +417,7 @@ Pressing **Ctrl-C** also goes through step 5, so work committed so far is kept.
 You land in Claude Code, running in the VM in `~/work` on branch `agent/session-…`, in your Terminal. Claude starts in your default permission mode (auto mode on current versions; Shift+Tab switches). The script sets `AGENT_ATTENDED=1`, so the `CLAUDE.md` section lets Claude ask you questions; all the other rules still apply.
 
 - Quitting Claude leaves you in a shell in `~/work`, where you can run `git log`, `xcodebuild`, or `claude` again.
-- Exiting that shell ends the session. If there are uncommitted changes, they're listed and you're asked `Keep them as a WIP commit? [Y/n]`. Then the commits are fetched into your repo and the VM is deleted.
+- Exiting that shell ends the session. If there are uncommitted changes, they're listed and you're asked `Keep them as a WIP commit? [Y/n]`. Then the commits are fetched into your repo and the VM is deleted. Afterwards, `~/agent-jobs/session-…/denials.md` lists any denied or failed tool calls ([§11.7](#117-review-denied-and-failed-commands-and-tune-the-rules)).
 
 ### Watching the Simulator (`--gui`)
 
@@ -438,6 +441,8 @@ The new run gets its own branch on top of it.
 ## 11. Review and integrate the results
 
 Every run leaves a branch `agent/<run-name>` in your repository. Nothing is merged, checked out or pushed for you.
+
+If the agent's commits change any file that defines its own limits (`CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `GEMINI.md`, `.claude/`, `.mcp.json`, `.cursorrules`, `.cursor/`, `.github/copilot-instructions.md`, `.github/instructions/`), the script prints **BLOCKED**, lists the files, and puts the commits on `agent-quarantine/<run-name>` instead, with the list saved to `~/agent-jobs/<run>/PROTECTED-FILES-CHANGED.txt`. Inspect them; if you decide the rest of the work is good, cherry-pick the commits you want and drop the limit-file changes. The patterns live in `PROTECTED_RE` near the top of `agent.sh`.
 
 ### 11.1 Read what it did
 
@@ -502,6 +507,33 @@ git worktree remove ../MyApp-review         # if you used one
 ```
 
 `~/agent-jobs` is your audit trail; keep it as long as it's useful.
+
+### 11.7 Review denied and failed commands, and tune the rules
+
+Every tool call in the VM is recorded, so you can see what the restrictions blocked, what failed, and what the agent did instead, then decide whether to loosen a rule (it blocked legitimate work) or tighten one (the agent tried to get around it).
+
+**How it's recorded.** The image's managed settings run an audit hook, `/usr/local/libexec/agent-audit`, on every `PreToolUse`, `PostToolUse`, `PostToolUseFailure` and `PermissionDenied` event. It appends Claude Code's JSON for each event to `~/.agent-audit/events.jsonl` in the VM. While the run is going, `agent.sh` follows that file over SSH and saves each line on your Mac as `audit.jsonl` the moment it's written, so lines can't be changed afterwards. At the end it also fetches the VM's own copy (`audit.vm.jsonl`) and, if that has fewer lines than were captured live, the report warns that the log was truncated or replaced. Jobs additionally keep Claude Code's own event stream (`events.stream.jsonl`), whose final result lists every permission denial; sessions bring back their transcripts (`transcripts/`) instead. Both supply Claude's messages for the report.
+
+Commands are kept complete. The only change is that the exact values of the Claude credential and the GitHub token are replaced with `[REDACTED:…]` in everything saved on your Mac.
+
+**The per-run report.** When a run ends, `agent.sh` prints a one-line count and writes `~/agent-jobs/<run>/denials.md`. For every call that wasn't successful it shows:
+
+- the status: **denied** (by a deny rule or auto mode, with the reason when Claude Code gives one), **blocked** (started but never produced a result, usually a deny rule), **failed** (ran and returned an error) or **interrupted**;
+- the matching deny rule from `claude_deny_rules`, so you know exactly which line to change;
+- the complete command (or, for file edits, the complete tool input);
+- what Claude said just before it;
+- **What it did next:** the following calls, with their complete commands, statuses and Claude's messages, until one succeeded (at most five);
+- a **Possible workaround attempt** flag when another call was blocked right after a denial, for example `python3` denied, then `perl`, then a script.
+
+**Across runs.** `./agent.sh denials` groups every denied and failed call from all runs that have a report, by matching rule (or, for failures, by command), with counts, the number of runs affected and example commands. It also saves the summary to `~/agent-jobs/DENIALS.md`.
+
+**Acting on it.**
+
+- A rule that keeps blocking legitimate work: remove or narrow it in `claude_deny_rules` in `agent.pkr.hcl`, then `./agent.sh tools`.
+- A workaround chain: add rules for the routes it tried, and consider a line in your `CLAUDE.md` explaining the expected way to do that task.
+- Repeated failures of the same command (a missing tool, a wrong simulator name): fix the environment (`brew_packages`, `sdk_platforms`) or your project's `CLAUDE.md` instructions.
+
+The matching rule is found by applying your current `claude_deny_rules` to the recorded command, so if you change the rules later, older reports keep the rule names from when they were generated. Calls made by the build itself (build phases, package plugins) aren't tool calls and aren't recorded.
 
 ---
 
@@ -752,6 +784,9 @@ Then check the firewall's monitor and `/opt/homebrew/var/log/tinyproxy/tinyproxy
 | Softnet errors when starting a run | Softnet needs SUID or passwordless sudo ([§3](#softnet-network-isolation-for-runs)); or remove `--net-softnet` to test. |
 | Can't start a VM: limit reached | Only two macOS VMs can run at once. `tart list` shows running ones; `tart stop <name>`. |
 | macOS setup screens in the `--gui` window | First login of the `agent` account in each fresh clone. Harmless for Claude. Getting past them once in the image needs an extra build step. |
+| `BLOCKED: the agent's commits change files that define its own limits` | Intended: see [§11](#11-review-and-integrate-the-results). The work is on `agent-quarantine/<run>`. |
+| `Could not build the audit report.` | Check that `jq` is installed (`jq --version`). The raw data is still in `audit.jsonl` and `events.stream.jsonl`. |
+| A report shows calls as **blocked** that weren't denied | A blocked call is one with no recorded result. The last call of a run that was stopped, or a tool whose result hook didn't fire, also shows this way. |
 | A run was killed and its VM is left over | `tart list`, then `tart stop job-…; tart delete job-…`. If `~/agent-jobs/<run>/out.bundle` exists, fetch it: `git fetch ~/agent-jobs/<run>/out.bundle agent/<run>:agent/<run>`. |
 | `Remote host identification has changed` warnings | Shouldn't happen: the scripts don't record VM host keys, since each VM is new. For manual `ssh`, add `-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null`. |
 | Software Update in a VM stalls | Expected; see [Update macOS](#update-macos). Stop the VM and delete it. |
@@ -777,6 +812,8 @@ These parts were written from documentation or memory and haven't been confirmed
 - Whether the release (not beta) Xcode 27.2 bundles `xcprojformatter`.
 - Whether macOS setup screens appear in `--gui` sessions.
 - How the iOS Simulator performs inside a Tart guest.
+- The audit hook payloads: the field `PermissionDenied` uses for its reason, whether `Bash` results include an exit code, and the format of session transcripts. The report falls back gracefully if a field is missing.
+- For the optional network allowlist: whether Little Snitch/LuLu can see Tart VM traffic directly, how Softnet combines `--net-softnet-block 0.0.0.0/0` with an allow entry, and the exact tinyproxy directive names in your version.
 
 ---
 
