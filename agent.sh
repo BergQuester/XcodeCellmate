@@ -13,6 +13,7 @@
 #                     CLAUDE_CODE_OAUTH_TOKEN  from `claude setup-token` (Pro/Max/Team/Enterprise subscription)
 #                     ANTHROPIC_API_KEY        Console API key (pay per token)
 #                   GH_TOKEN (fine-grained, READ-ONLY: this is what prevents pushes)
+# Put these in .env (copy env.template), or export them in your shell (the shell wins).
 #
 # Code in:  the starting branch's committed history, as a git bundle (uncommitted work stays behind).
 # Code out: new commits on agent/<name>, fetched into your repo as a bundle. Uncommitted changes
@@ -22,6 +23,16 @@
 #           Needs jq on your Mac (brew install jq).
 set -euo pipefail
 PKR="$(cd "$(dirname "$0")" && pwd)/agent.pkr.hcl"
+
+# Load .env next to this script (template: env.template). Variables already set in the shell win.
+if [ -f "$(dirname "$PKR")/.env" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
+    k="${BASH_REMATCH[1]}" v="${BASH_REMATCH[2]}"
+    v="${v%\"}" v="${v#\"}" v="${v%\'}" v="${v#\'}"
+    [ -n "${!k:-}" ] || export "$k=$v"
+  done < "$(dirname "$PKR")/.env"
+fi
 
 # ---------- image builds ----------
 

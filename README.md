@@ -139,6 +139,7 @@ Put the files in a folder of their own, for example `~/tartvmconfigs`:
 tartvmconfigs/
 ├── agent.sh
 ├── agent.pkr.hcl
+├── env.template
 ├── CLAUDE-tart-vm-section.md
 └── README.md
 ```
@@ -186,6 +187,8 @@ read -rs PKR_VAR_admin_password && export PKR_VAR_admin_password
 ```
 
 Type the password and press Enter (nothing is shown). Keep it in your password manager; you need it to log in to a VM as `admin`. The variable lasts only for this Terminal window.
+
+To avoid setting it each time, put it in a `.env` file instead ([§7](#using-a-env-file)).
 
 ### 6.3 Build both layers
 
@@ -310,6 +313,34 @@ export GH_TOKEN="$(security find-generic-password -a "$USER" -s agent-github -w)
 ```
 
 Inside the VM the values are written to `~/.job-env`, readable only by `agent`, and disappear with the VM.
+
+### Using a `.env` file
+
+Instead of exporting variables in each Terminal window, you can keep them in a `.env` file next to `agent.sh`. `env.template` lists every variable, with instructions for creating each token:
+
+```sh
+cp env.template .env
+chmod 600 .env
+```
+
+Open `.env`, fill in the values you need and uncomment those lines:
+
+| Variable | Needed for | Notes |
+| --- | --- | --- |
+| `PKR_VAR_admin_password` | `xcode`, `tools` | VM admin password ([§6.2](#62-set-the-vm-admin-password)) |
+| `PKR_VAR_ssh_pubkey_path` | `xcode`, `tools` | Optional; defaults to `~/.ssh/id_ed25519.pub` |
+| `CLAUDE_CODE_OAUTH_TOKEN` | `run`, `session` | Subscription token; or use the API key below |
+| `ANTHROPIC_API_KEY` | `run`, `session` | Used only if `CLAUDE_CODE_OAUTH_TOKEN` isn't set |
+| `GH_TOKEN` | `run`, `session` | Read-only fine-grained token |
+
+How `agent.sh` reads it:
+
+- It loads `.env` from its own folder on every run, so it works from any working directory.
+- **Variables already exported in your shell win.** You can keep some values in the Keychain (above) and the rest in `.env`, or override a value for one run with `GH_TOKEN=… ./agent.sh run …`.
+- Lines must be `NAME=value`. Lines starting with `#` are ignored, and quotes around a value are removed. Don't add a comment after a value on the same line; it becomes part of the value.
+- `.env` is in `.gitignore`. Don't rename it or commit it.
+
+The trade-off: `.env` stores your tokens as plain text on disk, readable by anything running as your user. The Keychain keeps them encrypted until you load them. If you use `.env`, keep it at `chmod 600`, give the tokens short expirations, and don't let backups or sync tools copy the folder somewhere less private.
 
 ---
 
@@ -788,7 +819,7 @@ Then check the firewall's monitor and `/opt/homebrew/var/log/tinyproxy/tinyproxy
 | --- | --- |
 | `No route to host` connecting to the VM; Packer stuck at "Waiting for SSH" | Your terminal app lacks Local Network permission ([§3](#grant-your-terminal-local-network-access)). Also check VPNs (`route get <vm-ip>` should show a `bridge…` interface, not `utun…`) and stop Apple's `container` service. |
 | Packer times out waiting for SSH, VM is on the desktop | Raise `ssh_timeout` in both `source` blocks (e.g. `"600s"`). If SSH is refused, check *System Settings → General → Sharing → Remote Login* in the VM. |
-| `PKR_VAR_admin_password: export PKR_VAR_admin_password first` | Set it in this Terminal window ([§6.2](#62-set-the-vm-admin-password)). |
+| `PKR_VAR_admin_password: export PKR_VAR_admin_password first` | Set it in this Terminal window ([§6.2](#62-set-the-vm-admin-password)), or uncomment it in `.env` ([§7](#using-a-env-file)). |
 | `Not found: /Volumes/My Shared Files/xcode/…` | The `.xip` path is wrong or the file moved. Pass the path to the `.xip` as it is on your Mac. |
 | `stat agent-base.pkr.hcl: no such file or directory` | Run `agent.sh` from the folder with both files, or keep them together. |
 | Build fails at `tart rename` | Your Tart version may not have `rename`. Run `tart --help`; as a workaround, change the `tart rename` line in `swap()` in `agent.sh` to `tart clone "$1-next" "$1" && tart delete "$1-next"`. |
