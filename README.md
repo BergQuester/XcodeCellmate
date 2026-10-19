@@ -1,7 +1,7 @@
 # Claude Code in disposable macOS VMs
 
 ## Warning
-While this is meant to provide isolation, this configuration is still early in development. Even with a mature config, we are dealing with LLM agents and there will alway be the possibility of the agent breaking out of it's jail. Safty is not gauranteed.
+While this is meant to provide isolation, this configuration is still early in development. Even with a mature config, we are dealing with LLM agents and there will alway be the possibility of the agent breaking out of it's jail. Safety is not gauranteed.
 
 Run Claude Code against your Xcode projects inside throwaway macOS virtual machines, either as an **unattended job** or as an **attended session**, without giving it access to your Mac, your real repository, or push rights on GitHub. Each run starts from a prebuilt image in seconds, and only the commits it makes come back to you, as a branch you review before anything is built on your own machine.
 
@@ -83,6 +83,7 @@ your repo ◄──git fetch── out.bundle ◄──scp───────�
 - **An Apple Developer account** to download Xcode (including betas) from <https://developer.apple.com/download/>.
 - **A Claude subscription (Pro, Max, Team or Enterprise) or an Anthropic API key** for Claude Code (see [§7](#7-credentials)).
 - **A GitHub fine-grained personal access token** with read-only permissions (see [§7](#7-credentials)).
+- **`jq` on your Mac** for the audit reports (`brew install jq`; recent macOS versions also include it at `/usr/bin/jq`).
 - **An SSH key pair** on your Mac (`~/.ssh/id_ed25519.pub` by default). Create one with `ssh-keygen -t ed25519` if you don't have it.
 
 Apple's macOS license, enforced by the Virtualization framework, allows at most **two macOS VMs running at once** per Mac. That means two jobs/sessions at a time, or one while an image build is running.
@@ -161,7 +162,7 @@ All the settings you're expected to change are at the top of `agent.pkr.hcl`, un
 | `base_image` | `ghcr.io/cirruslabs/macos-golden-gate-xcode:27` | The starting image. Pin it by digest (`…@sha256:…`) for reproducible builds; see [§12](#12-maintenance). |
 | `sdk_platforms` | empty (= latest iOS) | Simulator runtimes installed with Xcode; see [§6.4](#64-choose-sdk-platforms-and-versions). Can be overridden per build on the command line. |
 | `brew_packages` | `gh`, `jq`, `xcbeautify` | Homebrew packages installed in the agent layer. |
-| `claude_deny_rules` | push, clone, web and SSH commands | Claude Code deny rules, written to managed settings (see [§13](#13-security-model-and-its-limits)). |
+| `claude_deny_rules` | git/`gh` writes, web and network tools, nested `claude`, signing, `sudo`, Homebrew, version and package managers | Claude Code deny rules, written to root-owned managed settings, grouped by category. Remove the `pod`/`bundle`/`npm` rules if a project needs them. See [§13](#13-security-model-and-its-limits). |
 | `ssh_pubkey_path` | `~/.ssh/id_ed25519.pub` | The only key that can log in to job VMs as `agent`. |
 
 VM sizes are set in the two `source` blocks: `cpu_count`, `memory_gb` and `disk_size_gb` in `source "tart-cli" "xcode"`, and `cpu_count`/`memory_gb` in `source "tart-cli" "agent"` (which sizes every job and session VM).
@@ -562,7 +563,7 @@ Claude Code is installed when the agent layer is built. Rebuild periodically (`.
 | **Non-admin `agent` user**, key-only SSH | System-level changes inside the VM; the admin password is never given to the agent. |
 | **Read-only GitHub token** | Pushes, PRs, comments, any write to GitHub. This is the real push guarantee. |
 | **Disabled push URL and `pre-push` hook** | Accidental pushes (backup only: the agent could undo these). |
-| **Claude Code deny rules** in root-owned managed settings | `git push`, `git clone`, `gh repo clone/fork`, `git submodule add`, `WebFetch`, `WebSearch`, `curl`, `wget`, `ssh`, `scp`, `sftp`, `rsync`. Highest precedence, apply in every permission mode, and the agent can't edit them. |
+| **Claude Code deny rules** in root-owned managed settings | Pushing, cloning, changing remotes or the agent branch; `gh` writes and `gh api`; web and network tools; nested `claude`; non-Xcode languages and nested shells (`python3`, `node`, `ruby`, `perl`, `bash`/`sh`/`zsh`, `env`, `eval`, `source`, `./*.sh`…); editing the files that define its limits (`CLAUDE.md`, `AGENTS.md`, `.claude/`, `.mcp.json`, `~/.claude/`, `~/.job-env`, git and shell config…); signing and distribution; `sudo`; Homebrew; version managers; package managers other than SwiftPM. Highest precedence, apply in every permission mode, and the agent can't edit them. |
 | **Auto mode** | A classifier reviews risky actions before they run, including sending data to external endpoints and download-and-execute, and isn't influenced by the contents of files and pages Claude reads. |
 | **Softnet** | The VM reaching your local network. |
 | **`CLAUDE.md` rules** | Steering Claude (and the classifier) away from pushing, cloning, web/SSH, build-script and dependency changes. |
@@ -573,7 +574,7 @@ Claude Code is installed when the agent layer is built. Rebuild periodically (`.
 - **Inside the VM, during a run:** your source code, the Claude credential (subscription token or API key) and the GitHub token. The VM has internet access (Claude Code needs Anthropic's API, and git/xcodebuild need GitHub), so a determined or prompt-injected agent could try to send them out. Auto mode and the deny rules make this much harder, not impossible. Use a dedicated API key with a spend limit (or keep the subscription token's exposure in mind) and a short-lived, narrowly scoped GitHub token.
 - **Deny rules match commands as written.** `python3 -c 'import urllib…'`, `/usr/bin/curl`, or a script containing `git push` won't match. They're a backstop.
 - **Auto mode reduces risk but isn't a guarantee.** The classifier can still allow a risky action, which is why Anthropic recommends running it in isolated environments like these VMs.
-- **Network-level filtering isn't set up.** Tart's `--net-softnet-allow`/`--net-softnet-block` filter by IP range (fragile for services like GitHub), and Claude Code's Bash sandbox can restrict domains but hasn't been tested with `xcodebuild` and the Simulator here.
+- **Network-level filtering isn't set up by default.** See [Optional: allowlist network access from your Mac](#optional-allowlist-network-access-from-your-mac) for enforcing it on your Mac with a proxy and a host firewall.
 - **`xcode-base` keeps the default `admin`/`admin` password.** It never runs jobs and stays on your Mac, but don't share or push it to a registry.
 - **Xcode betas** are pre-release software running agent-written code; that's another reason the review step matters.
 
@@ -648,7 +649,7 @@ The VM is deleted when you finish. The only thing kept is the commits on `$AGENT
 
 - Commit early and often: after each self-contained step that builds, and at least every time you would otherwise stop to report progress.
 - Write clear commit messages: a short summary line, then what changed and why. Record any assumptions you made in the message; in unattended jobs nobody can answer questions.
-- Stay on `$AGENT_BRANCH`. Don't create or switch to other branches, and don't use `git stash` as storage.
+- Stay on `$AGENT_BRANCH`. Don't create, switch to, rename or delete branches, don't change remotes or global git config, and don't use `git stash` as storage.
 - Don't rewrite history below `$AGENT_BASE_BRANCH` (no rebasing onto other branches, no amending or squashing commits you didn't make in this job). Amending your own unpublished commits is fine.
 - If you can't finish, commit what you have with a message starting `WIP:` that says what's done, what isn't, and what you'd try next.
 - Before finishing, run `git status` and make sure the working tree is clean.
@@ -657,13 +658,19 @@ The VM is deleted when you finish. The only thing kept is the commits on `$AGENT
 
 You have read-only GitHub access. Don't run `git push`, don't change remotes or push URLs, don't disable the pre-push hook, and don't try to open pull requests, issues or comments. A blocked push is expected, not an error to work around. The developer reviews your commits and decides what to publish.
 
+You may read this repository's issues and pull requests with `gh issue list`, `gh issue view`, `gh pr list`, `gh pr view` and `gh pr diff`. Don't use `gh api`, `gh auth`, `gh browse`, `gh repo` or any `gh` command that creates, edits, comments on, merges or checks out anything.
+
 ### Don't clone repositories
 
 Work only in the checkout you started in. Don't clone other git repositories: no `git clone`, `gh repo clone`, `git submodule add`, or downloading a repo as an archive, including to read code for reference. Resolving the project's own declared dependencies through the build tools (for example `xcodebuild -resolvePackageDependencies` for Swift packages already listed in the project) is fine. If the task seems to need code from another repository, don't fetch it; say so in your final summary and in a `WIP:` commit if you can't continue without it.
 
 ### No web or SSH access
 
-Don't browse or download from the web: no web search or fetch tools, and no `curl`, `wget` or similar HTTP clients, including in scripts you write and run. Don't use `ssh`, `scp`, `sftp` or `rsync` to reach other machines. Work from the repository, the installed tools and Xcode's documentation. Fetching the project's declared dependencies through the build tools and using `gh` or `git fetch` against this repository's GitHub remote are the only network access you need. If the task requires information you can't get this way, say so in your final summary.
+Don't browse or download from the web: no web search or fetch tools, and no `curl`, `wget` or similar HTTP clients, including in scripts you write and run. Don't open URLs (`open https://…`), and don't use `osascript`, `nc`, `socat`, `telnet` or `ftp`. Don't use `ssh`, `scp`, `sftp` or `rsync` to reach other machines. Work from the repository, the installed tools and Xcode's documentation. Fetching the project's declared dependencies through the build tools and using `gh` or `git fetch` against this repository's GitHub remote are the only network access you need. If the task requires information you can't get this way, say so in your final summary.
+
+### Don't change your own limits
+
+Never create, edit, move or delete the files that define how you work, by any means (editing tools, shell commands, scripts or generated files). This includes, but isn't limited to: `CLAUDE.md`, `CLAUDE.local.md` and `AGENTS.md` anywhere in the repo, other agents' instruction files (`GEMINI.md`, `.cursorrules`, `.cursor/`, `.github/copilot-instructions.md`), anything under `.claude/` (settings, agents, commands, hooks, skills), `.mcp.json`, and in your home directory `~/.claude/`, `~/.claude.json`, `~/.job-env`, `~/.agent-audit/`, git configuration and hooks, and shell startup files. Every tool call you make, including denied and failed ones, is logged for the developer's review. If you think one of them should change, describe the change in your final summary and let the developer make it. Commits that touch these files are quarantined and not delivered.
 
 ### Blocked actions
 
@@ -672,9 +679,14 @@ You're running in auto mode: a safety classifier reviews actions and may block s
 ### Building and testing
 
 - Build and test with `xcodebuild`, always with `CODE_SIGNING_ALLOWED=NO`. There are no signing identities in the VM.
+- Don't sign, notarize, archive for distribution or upload anything: no `codesign`, `notarytool`, `altool`, `-exportArchive`, `-allowProvisioningUpdates` or `fastlane`.
 - Use an iOS Simulator destination. List what exists with `xcrun simctl list devices available`.
 - Don't commit a change that doesn't build. If tests fail and you can't fix them, say so in the commit message.
 - Pipe long `xcodebuild` output through `xcbeautify` to keep it readable.
+
+### Swift and Xcode tooling only
+
+Use Swift and Xcode's tools (`swift`, `swiftc`, `xcodebuild`, `xcrun`, `simctl`) plus ordinary command-line utilities (`git`, `grep`, `find`, `sed`, `awk`, `jq` and the like). Don't run other languages or interpreters (`python`/`python3`, `node`, `ruby`, `perl`, `php`, `java`, `osascript` and so on), don't start nested shells (`bash -c`, `sh`, `zsh`, `env …`, `eval`, `source`), and don't write and run shell scripts. If you need helper logic, write it in Swift. The project's own build phases run by `xcodebuild` are fine.
 
 ### Project file
 
@@ -684,7 +696,9 @@ You're running in auto mode: a safety classifier reviews actions and may block s
 ### Secrets and scope
 
 - `~/.job-env` holds API credentials. Never print, copy, log or commit its contents, and never write tokens into files in the repo.
-- Only work inside the repo checkout. Don't install system-wide software or change macOS settings.
+- Only work inside the repo checkout. Don't install system-wide software or change macOS settings, and don't use `sudo`.
+- Don't change your own setup: don't start other `claude` sessions, add MCP servers, or edit Claude Code's settings.
+- Use the toolchains and tools already installed. Don't use Homebrew, and don't install or switch language, toolchain or Xcode versions (asdf, mise, nvm, fnm, volta, pyenv, rbenv, rvm, jenv, SDKMAN, rustup, swiftly, swiftenv, xcodes, `xcode-select -s` and the like). Don't install packages or tools globally either: no `gem install`, `pip install`, `pipx`, `uv tool`, `npm`/`yarn`/`pnpm`/`bun` global installs, `npx`/`bunx`, `cargo install`, `go install`, Mint, MacPorts, `mas`, `installer` or `softwareupdate`. This project uses SwiftPM only: resolving its declared Swift package dependencies is fine; CocoaPods, Bundler, npm and other package managers are not used here. If the task needs a tool or version that isn't installed, say so in your summary instead of installing it.
 
 ### Finishing
 
