@@ -359,7 +359,7 @@ build {
       xip --expand "$XIP"
       APP=$(ls -d /tmp/xcode/*.app | head -1)
       NEW="/Applications/$(basename "$XIP" .xip).app"
-      sudo rm -rf "$NEW" && sudo mv "$APP" "$NEW" && rm -rf /tmp/xcode
+      sudo rm -rf "$NEW" && sudo mv "$APP" "$NEW" && cd / && rm -rf /tmp/xcode
 
       # Keep exactly one Xcode, reachable at a stable path.
       for x in /Applications/Xcode*.app; do [ "$x" = "$NEW" ] || sudo rm -rf "$x"; done
