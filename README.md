@@ -123,7 +123,17 @@ Open **System Settings → Privacy & Security → Local Network** and turn on th
 
 ### Softnet (network isolation for runs)
 
-Jobs and sessions start VMs with Tart's `--net-softnet`, which isolates them from your local network. Softnet needs either its binary set SUID root or passwordless `sudo`, so expect to set that up the first time you run a job; check `tart run --help` and Tart's documentation for the exact steps on your version. If you want to get going without it, remove `--net-softnet` from the two `tart run` lines in `agent.sh` (and accept that the VM can then reach your LAN).
+Jobs and sessions start VMs with Tart's `--net-softnet`, which isolates them from your local network. Softnet must run as root, either because its binary is SUID root or because you have passwordless `sudo`. Set the SUID bit once:
+
+```sh
+SOFTNET="$(realpath "$(which softnet)")"
+sudo chown root:wheel "$SOFTNET" && sudo chmod u+s "$SOFTNET"
+ls -l "$SOFTNET"    # should show -rwsr-xr-x  root  wheel
+```
+
+`brew upgrade softnet` installs a fresh copy without the bit, so repeat this after upgrading. `agent.sh run` and `agent.sh session` check for it before creating a VM and print these commands if it's missing.
+
+If you want to get going without it, remove `--net-softnet` from the `tart run` line in `boot_vm()` in `agent.sh` and the check in `start_vm()` (and accept that the VM can then reach your LAN).
 
 ### Apple's `container` tool
 
@@ -827,7 +837,8 @@ Then check the firewall's monitor and `/opt/homebrew/var/log/tinyproxy/tinyproxy
 | `<platform> <version> is not available for download` | The retry with `-architectureVariant arm64` failed too. This Xcode may not offer that runtime from the command line; see *Older runtimes* in [§6.4](#64-choose-sdk-platforms-and-versions). |
 | `xcrun simctl runtime delete all` fails | Check `xcrun simctl runtime delete --help`; delete runtimes by identifier instead (`xcrun simctl runtime list`). |
 | A job's log shows nearly every command denied | Auto mode wasn't available, so the session started in Manual mode, which denies everything that would prompt in `-p` runs. Check the Claude Code version and auto mode requirements in the [permission modes docs](https://code.claude.com/docs/en/permission-modes). |
-| Softnet errors when starting a run | Softnet needs SUID or passwordless sudo ([§3](#softnet-network-isolation-for-runs)); or remove `--net-softnet` to test. |
+| `Softnet (--net-softnet) must run as root`, or the VM window appears and closes at once | Softnet isn't SUID root ([§3](#softnet-network-isolation-for-runs)); run the commands `agent.sh` prints. If a VM fails to boot for another reason, `agent.sh` prints its `tart.log` and stops. |
+| `The VM stopped unexpectedly` at the end of a run | The VM window was closed or the VM crashed. `agent.sh` restarts it without a window to collect the commits; if that fails it keeps the VM and prints how to recover the work. |
 | Can't start a VM: limit reached | Only two macOS VMs can run at once. `tart list` shows running ones; `tart stop <name>`. |
 | macOS setup screens in the `--gui` window | First login of the `agent` account in each fresh clone. Harmless for Claude. Getting past them once in the image needs an extra build step. |
 | `BLOCKED: the agent's commits change files that define its own limits` | Intended: see [§11](#11-review-and-integrate-the-results). The work is on `agent-quarantine/<run>`. |

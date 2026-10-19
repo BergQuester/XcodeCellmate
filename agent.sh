@@ -52,9 +52,50 @@ build() {  # build <layer> [packer args...]  -> builds "<layer>-base-next", then
 PROTECTED_RE='(^|/)(claude(\.local)?\.md|agents\.md|gemini\.md|\.mcp\.json|\.cursorrules)$|(^|/)(\.claude|\.cursor)/|(^|/)\.github/(copilot-instructions\.md|instructions/)'
 
 OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ServerAliveInterval=60)
-AUDIT_PID="" GUI=0 KIND="" REPO="" BASE="" BRANCH="" OUT="" VM="" IP=""
+AUDIT_PID="" GUI=0 KIND="" REPO="" BASE="" BRANCH="" OUT="" VM="" IP="" TART_PID=""
+BOOT_TIMEOUT=300   # seconds to wait for a VM to accept SSH
 
 rsh() { ssh "${OPTS[@]}" agent@"$IP" "$@"; }   # run a command in the VM as agent
+
+softnet_fix() {
+  echo "Softnet (--net-softnet) must run as root. Make it SUID root once (redo after 'brew upgrade softnet'):" >&2
+  echo '  SOFTNET="$(realpath "$(which softnet)")"' >&2
+  echo '  sudo chown root:wheel "$SOFTNET" && sudo chmod u+s "$SOFTNET"' >&2
+}
+
+# check_softnet: fail before cloning a VM if softnet can't get root (SUID binary or passwordless sudo).
+check_softnet() {
+  local sn
+  sn="$(command -v softnet || true)"
+  [ -n "$sn" ] || { echo "softnet not found; it's needed for --net-softnet (see README §3)." >&2; exit 1; }
+  sn="$(realpath "$sn")"
+  [ -u "$sn" ] && [ "$(stat -f %u "$sn")" = 0 ] && return
+  sudo -n true 2>/dev/null && return
+  softnet_fix; exit 1
+}
+
+# boot_vm: start $VM in the background and wait until SSH works; sets IP and TART_PID.
+# Returns 1 (after printing tart.log) if tart exits or the VM isn't reachable in BOOT_TIMEOUT.
+boot_vm() {
+  local args=(--net-softnet) ip deadline=$((SECONDS + BOOT_TIMEOUT))
+  [ "$GUI" = 1 ] || args+=(--no-graphics)
+  tart run "${args[@]}" "$VM" >>"$OUT/tart.log" 2>&1 &
+  TART_PID=$!
+  echo "Booting $VM..."
+  until ip=$(tart ip "$VM" 2>/dev/null) && ssh -o ConnectTimeout=5 "${OPTS[@]}" agent@"$ip" true 2>/dev/null; do
+    if ! kill -0 "$TART_PID" 2>/dev/null; then
+      echo "The VM stopped while booting. tart.log:" >&2
+    elif [ "$SECONDS" -ge "$deadline" ]; then
+      echo "The VM wasn't reachable over SSH after ${BOOT_TIMEOUT}s. tart.log:" >&2
+    else
+      sleep 2; continue
+    fi
+    sed 's/^/  /' "$OUT/tart.log" >&2
+    grep -qi softnet "$OUT/tart.log" && softnet_fix
+    return 1
+  done
+  IP="$ip"
+}
 
 # start_vm <job|session> <repo> [branch]: clone agent-base, boot it, copy the branch in.
 start_vm() {
@@ -75,6 +116,7 @@ start_vm() {
   git -C "$REPO" rev-parse --verify -q "$BASE" >/dev/null || { echo "No branch '$BASE' in $REPO" >&2; exit 1; }
   [ -z "$(git -C "$REPO" status --porcelain)" ] ||
     echo "Note: $REPO has uncommitted changes; they are NOT copied into the VM."
+  check_softnet
 
   local name ORIGIN
   name="$KIND-$(date +%Y%m%d-%H%M%S)"
@@ -86,17 +128,9 @@ start_vm() {
   tart clone agent-base "$name"; VM="$name"
   trap finish EXIT
   trap 'exit 130' INT TERM          # make Ctrl-C go through finish()
-  if [ "$GUI" = 1 ]; then
-    tart run --net-softnet "$VM" >"$OUT/tart.log" 2>&1 &
+  [ "$GUI" = 1 ] &&
     echo "The VM window will open. Don't close it: end the session from this Terminal so commits are collected."
-  else
-    tart run --no-graphics --net-softnet "$VM" >"$OUT/tart.log" 2>&1 &
-  fi
-  echo "Booting $VM..."
-  local ip
-  until ip=$(tart ip "$VM" 2>/dev/null); do sleep 2; done
-  until ssh "${OPTS[@]}" agent@"$ip" true 2>/dev/null; do sleep 2; done
-  IP="$ip"
+  boot_vm || exit 1
 
   scp -q "${OPTS[@]}" "$OUT/in.bundle" agent@"$IP":
   printf 'export %s=%q\nexport GH_TOKEN=%q\nexport TART_AGENT_VM=1\nexport AGENT_ATTENDED=%q\nexport AGENT_BASE_BRANCH=%q\nexport AGENT_BRANCH=%q\n' \
@@ -388,11 +422,22 @@ collect() {
 }
 
 finish() {
-  local rc=$?
+  local rc=$? keep=0
   trap - EXIT INT TERM
+  # The VM died after booting (window closed, crash): restart it headless to collect the commits.
+  if [ -n "$IP" ] && ! kill -0 "$TART_PID" 2>/dev/null; then
+    echo; echo "The VM stopped unexpectedly. Restarting it without a window to collect commits..." >&2
+    GUI=0; IP=""
+    if ! boot_vm; then
+      keep=1; rc=1
+      echo "Could not restart it, so $VM is kept with the work on $BRANCH. To recover it yourself:" >&2
+      echo "  tart run $VM   # log in as admin, then: sudo -u agent git -C /Users/agent/work log $BASE..$BRANCH" >&2
+      echo "When done: tart delete $VM" >&2
+    fi
+  fi
   [ -n "$IP" ] && { collect || echo "Could not collect commits from the VM." >&2; }
   [ -n "$IP" ] && { stop_audit || true; }
-  if [ -n "$VM" ]; then
+  if [ -n "$VM" ] && [ "$keep" = 0 ]; then
     tart stop "$VM" >/dev/null 2>&1 || true
     tart delete "$VM" || true
   fi
