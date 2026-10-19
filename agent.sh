@@ -101,6 +101,17 @@ if [ -n "$3" ]; then
   git remote add origin "$3"                       # fetch-only, via the read-only token
   git remote set-url --push origin PUSH-DISABLED
 fi
+# Open the project in Xcode's headless MCP server, so Xcode's tools can work on it.
+# perl's alarm caps the wait, since nothing here should block a run from starting.
+proj="$(find . -maxdepth 2 -name '*.xcworkspace' -not -path '*.xcodeproj/*' | sort | head -1)"
+[ -n "$proj" ] || proj="$(find . -maxdepth 2 -name '*.xcodeproj' | sort | head -1)"
+if [ -n "$proj" ]; then
+  if perl -e 'alarm 120; exec @ARGV' xcrun mcp-server open "$PWD/${proj#./}" >/dev/null 2>&1; then
+    echo "Opened ${proj#./} for Xcode's MCP tools."
+  else
+    echo "Note: couldn't open ${proj#./} in Xcode's MCP server; Claude can open it with its XcodeOpenWorkspace tool."
+  fi
+fi
 SETUP
   start_audit
 }

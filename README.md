@@ -48,7 +48,7 @@ ghcr.io/cirruslabs/macos-golden-gate-xcode:27     (Cirrus Labs base: macOS 27 + 
 xcode-base     your Xcode (beta) + command line tools + iOS SDK/simulator runtime + docs
         │  ./agent.sh tools           fast, rebuilt when tools or rules change
         ▼
-agent-base     Homebrew tools + non-admin "agent" user + Claude Code + git policy + deny rules
+agent-base     Homebrew tools + non-admin "agent" user + Claude Code + git policy + deny rules + Xcode MCP
         │  ./agent.sh run / session   seconds: a copy-on-write clone, nothing installed
         ▼
 job-… / session-…   throwaway VM, deleted when the run ends
@@ -202,7 +202,7 @@ What happens:
 5. **Documentation (manual step).** Packer pauses with a note. In the VM window, open Xcode. If its *Components* sheet appears, click **Download & Install** (iOS is already installed, so it should finish quickly). Then open **Xcode → Settings → Components** and download **Documentation** if it's offered. Quit Xcode, return to the Terminal, and press **Enter**.
 6. **Checks.** The Xcode version, iOS SDK version and installed runtimes are printed. Confirm they're what you expect.
 7. **Swap.** `xcode-base-next` replaces `xcode-base`.
-8. **Agent layer** (a few minutes, automatic): Homebrew packages, the non-admin `agent` user with your SSH key and automatic login, Claude Code, git identity and push backstop, Claude Code deny rules (printed as JSON so you can check them), and finally the admin password change. `agent-base-next` then replaces `agent-base`.
+8. **Agent layer** (a few minutes, automatic): Homebrew packages, the non-admin `agent` user with your SSH key and automatic login, Claude Code, git identity and push backstop, Claude Code deny rules (printed as JSON so you can check them), Xcode's MCP server for Claude (headless, printed with its status; see [§8.5](#85-xcode-mcp-tools)), and finally the admin password change. `agent-base-next` then replaces `agent-base`.
 
 Confirm the result:
 
@@ -345,6 +345,20 @@ The VM receives only committed history, so commit `CLAUDE.md` (and any other set
 ### 8.4 Check `.gitignore`
 
 Leftover changes at the end of a run are committed as `WIP:` **including untracked files**. Make sure in-repo build output (for example `.build/`, `DerivedData/` if you keep it in the repo, `*.xcresult`) is ignored, so it doesn't end up in those commits.
+
+### 8.5 Xcode MCP tools
+
+Claude in the VM can use Xcode's own tools through its MCP server (`xcrun mcpbridge`): building, running tests, the issue navigator, SwiftUI previews and documentation search. The agent layer sets this up:
+
+- **Headless mode**, so the tools work without the Xcode app running and without the approval alert nobody is there to click: `sudo xcrun mcp-server enable --unsafe-always-allow-all-agents`, and `allow-folder /Users/agent/work`. Allowing every agent is broader than approving Claude alone, but approval needs a pending request from a signed-in Claude, which the build doesn't have, and the only agents in a job VM are the job's own. Permissions need `sudo`, so the agent can't change them.
+- **Root-owned `/Library/Application Support/ClaudeCode/managed-mcp.json`** with the `xcode` server. It also takes exclusive control, so no other MCP server loads, including one a repo's `.mcp.json` defines.
+- **Deny rules for Xcode's file-changing tools** (`XcodeWrite`, `XcodeUpdate`, `XcodeInsertFile`, `XcodeRM`, `XcodeMV`, `XcodeMakeDir`, `XcodeNewProject`): they write files directly, past the `Edit` rules that protect `CLAUDE.md` and the rest. Claude's own editing tools do that work.
+
+When a run starts, `agent.sh` opens the first `.xcworkspace` (or else `.xcodeproj`) within two levels of the repo root in the headless server. For other layouts, Claude can open the project with the `XcodeOpenWorkspace` tool.
+
+Xcode's `BuildProject` uses the scheme's real signing settings, unlike the `CODE_SIGNING_ALLOWED=NO` builds the VM instructions ask for, so it can fail in a VM with no Apple account. If it does, keep building with `xcodebuild` and use the Xcode tools for tests, issues, previews and docs.
+
+To check it in a session, quit Claude to get the shell and run `xcrun mcp-server status` and `claude mcp list`, or run `/mcp` inside Claude.
 
 ---
 
@@ -597,6 +611,7 @@ Claude Code is installed when the agent layer is built. Rebuild periodically (`.
 | **Disabled push URL and `pre-push` hook** | Accidental pushes (backup only: the agent could undo these). |
 | **Claude Code deny rules** in root-owned managed settings | Pushing, cloning, changing remotes or the agent branch; `gh` writes and `gh api`; web and network tools; nested `claude`; non-Xcode languages and nested shells (`python3`, `node`, `ruby`, `perl`, `bash`/`sh`/`zsh`, `env`, `eval`, `source`, `./*.sh`…); editing the files that define its limits (`CLAUDE.md`, `AGENTS.md`, `.claude/`, `.mcp.json`, `~/.claude/`, `~/.job-env`, git and shell config…); signing and distribution; `sudo`; Homebrew; version managers; package managers other than SwiftPM. Highest precedence, apply in every permission mode, and the agent can't edit them. |
 | **Auto mode** | A classifier reviews risky actions before they run, including sending data to external endpoints and download-and-execute, and isn't influenced by the contents of files and pages Claude reads. |
+| **Managed MCP config** (root-owned `managed-mcp.json`) | MCP servers other than Xcode's, including ones a repo's `.mcp.json` would start. Xcode's file-changing tools are denied, because the `Edit` rules don't cover them. |
 | **Softnet** | The VM reaching your local network. |
 | **`CLAUDE.md` rules** | Steering Claude (and the classifier) away from pushing, cloning, web/SSH, build-script and dependency changes. |
 | **Quarantine of limit-file changes** (in `agent.sh`) | Commits that touch `CLAUDE.md`, `AGENTS.md`, `.claude/`, `.mcp.json` or other agents' instruction files are put on `agent-quarantine/<run>` instead of `agent/<run>`, even if made through the shell. |

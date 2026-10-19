@@ -312,6 +312,13 @@ locals {
       PermissionDenied   = local.audit_hook
     }
   }
+
+  # Xcode's MCP server, as root-owned managed MCP config. This file also takes exclusive
+  # control: no other MCP servers load, including a repo's .mcp.json (which `claude -p`
+  # would otherwise load without asking).
+  managed_mcp = {
+    mcpServers = { xcode = { type = "stdio", command = "xcrun", args = ["mcpbridge"] } }
+  }
 }
 
 # ---------- sources ----------
@@ -512,6 +519,32 @@ build {
       sudo chmod 644 "$DIR/managed-settings.json"
       echo "Claude Code managed settings:"
       cat "$DIR/managed-settings.json"
+
+      printf '%s\n' '${jsonencode(local.managed_mcp)}' |
+        sudo tee "$DIR/managed-mcp.json" >/dev/null
+      sudo chown root:wheel "$DIR/managed-mcp.json"
+      sudo chmod 644 "$DIR/managed-mcp.json"
+      echo "Claude Code managed MCP servers:"
+      cat "$DIR/managed-mcp.json"
+    EOT
+    ]
+  }
+
+  # Xcode MCP in headless mode: agents use Xcode's tools without the Xcode app running and
+  # without the approval alert, which nobody is there to click. Granting permissions needs
+  # sudo, so the agent can't change them. Every agent is allowed because nothing can
+  # pre-approve Claude here (approval needs a pending request from a signed-in Claude) and
+  # the only agents in a job VM are the job's own.
+  provisioner "shell" {
+    inline_shebang = "/bin/bash -e"
+    inline = [<<-EOT
+      # Jobs clone the repo into this (empty) folder; Xcode may serve projects only under it.
+      sudo -u agent mkdir -p /Users/agent/work
+      sudo xcrun mcp-server enable --unsafe-always-allow-all-agents
+      sudo xcrun mcp-server allow-folder /Users/agent/work --always
+      echo "Xcode MCP status, as admin and as agent:"
+      xcrun mcp-server status
+      sudo -u agent -H xcrun mcp-server status
     EOT
     ]
   }
