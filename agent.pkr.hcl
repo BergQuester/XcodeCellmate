@@ -650,25 +650,65 @@ build {
   # sudo, so the agent can't change them. Every agent is allowed because nothing can
   # pre-approve Claude here (approval needs a pending request from a signed-in Claude) and
   # the only agents in a job VM are the job's own.
+  #
+  # mcp-server stores these permissions for the user who owns the login session it runs in
+  # (not $HOME or SUDO_USER), and signs them with a hash in that user's login keychain, which
+  # must be unlocked to write it (not to read it). So it runs in a session of agent's own:
+  # SSH to localhost with a throwaway key, a sudo rule for mcp-server only, and agent's login
+  # keychain created and unlocked with its password. The key and the sudo rule are removed after.
   provisioner "shell" {
-    inline_shebang = "/bin/bash -e"
+    inline_shebang   = "/bin/bash -e"
+    environment_vars = ["AGENT_PW=${local.agent_password}"]
     inline = [<<-EOT
       # Jobs clone the repo into this (empty) folder; Xcode may serve projects only under it.
       sudo -u agent mkdir -p /Users/agent/work
-      sudo xcrun mcp-server enable --unsafe-always-allow-all-agents
-      sudo xcrun mcp-server allow-folder /Users/agent/work --always
-      echo "Xcode MCP status, as admin and as agent:"
-      xcrun mcp-server status
-      sudo -u agent -H xcrun mcp-server status
+
+      tmp="$(mktemp -d)"
+      ssh-keygen -q -t ed25519 -N '' -f "$tmp/key"
+      sudo cp -p /Users/agent/.ssh/authorized_keys "$tmp/authorized_keys"
+      cleanup() {
+        sudo rm -f /etc/sudoers.d/zz-agent-mcp-server
+        sudo cp -p "$tmp/authorized_keys" /Users/agent/.ssh/authorized_keys
+        rm -rf "$tmp"
+      }
+      trap cleanup EXIT
+      sudo -u agent tee -a /Users/agent/.ssh/authorized_keys < "$tmp/key.pub" >/dev/null
+      echo 'agent ALL=(root) NOPASSWD: /usr/bin/xcrun mcp-server *' | sudo tee /etc/sudoers.d/zz-agent-mcp-server >/dev/null
+      sudo chmod 440 /etc/sudoers.d/zz-agent-mcp-server
+      sudo visudo -cqf /etc/sudoers.d/zz-agent-mcp-server
+
+      # The password goes over stdin (first line), not the command line.
+      { printf '%s
+' "$AGENT_PW"; cat <<'MCP'; } |
+      set -e
+      kc=login.keychain
+      [ -f ~/Library/Keychains/login.keychain-db ] || security create-keychain -p "$AGENT_PW" "$kc"
+      security list-keychains -d user -s "$kc"
+      security default-keychain -d user -s "$kc"
+      security login-keychain -d user -s "$kc"
+      security unlock-keychain -p "$AGENT_PW" "$kc"
+      sudo /usr/bin/xcrun mcp-server enable --unsafe-always-allow-all-agents
+      sudo /usr/bin/xcrun mcp-server allow-folder /Users/agent/work --always
+      security lock-keychain "$kc"
+      MCP
+        ssh -i "$tmp/key" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+          agent@localhost 'exec /bin/bash -c "read -r AGENT_PW && export AGENT_PW && exec /bin/bash -s"'
+
+      echo "Xcode MCP status for agent:"
+      sudo -u agent -H xcrun mcp-server status | tee "$tmp/status"
+      grep -q '^Permission: enabled' "$tmp/status" ||
+        { echo "Xcode MCP isn't enabled for agent" >&2; exit 1; }
     EOT
     ]
   }
 
-  # Last: retire admin/admin.
+  # Last: retire admin/admin. sysadminctl doesn't change the login keychain's password, so
+  # change it too, or admin's keychain stays locked with the old one.
   provisioner "shell" {
     environment_vars = ["NEW_ADMIN_PW=${var.admin_password}"]
     inline = [
       "sudo sysadminctl -resetPasswordFor admin -newPassword \"$NEW_ADMIN_PW\" -adminUser admin -adminPassword admin",
+      "security set-keychain-password -o admin -p \"$NEW_ADMIN_PW\" ~/Library/Keychains/login.keychain-db || echo \"Warning: admin's login keychain still has its old password\" >&2",
     ]
   }
 }
