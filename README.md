@@ -228,7 +228,9 @@ What happens:
 5. **Documentation (manual step).** Packer pauses with a note. In the VM window, open Xcode. If its *Components* sheet appears, click **Download & Install** (iOS is already installed, so it should finish quickly). Then open **Xcode → Settings → Components** and download **Documentation** if it's offered. Quit Xcode, return to the Terminal, and press **Enter**.
 6. **Checks.** The Xcode version, iOS SDK version and installed runtimes are printed. Confirm they're what you expect.
 7. **Swap.** `xcode-base-next` replaces `xcode-base`.
-8. **Agent layer** (a few minutes, automatic): Homebrew packages (installing `brew_packages`, then removing the base image's packages not in `brew_keep`; the log lists what was removed and what's left), the non-admin `agent` user with your SSH key and automatic login, Claude Code, git identity and push backstop, Claude Code deny rules (printed as JSON so you can check them), Xcode's MCP server for Claude (headless, printed with its status; see [§8.5](#85-xcode-mcp-tools)), and finally the admin password change. `agent-base-next` then replaces `agent-base`.
+8. **Agent layer** (a few minutes, automatic apart from step 9): Homebrew packages (installing `brew_packages`, then removing the base image's packages not in `brew_keep`; the log lists what was removed and what's left), the non-admin `agent` user with your SSH key and automatic login (with macOS's first-login setup screens skipped: Apple Account, Liquid Glass, Get Started, Welcome to macOS, Siri, and the rest), Claude Code, git identity and push backstop, Claude Code deny rules (printed as JSON so you can check them), Xcode's MCP server for Claude (headless, printed with its status; see [§8.5](#85-xcode-mcp-tools)).
+9. **Age range (manual step).** macOS has no way to skip or pre-answer this screen, so the VM restarts, logs `agent` in, and Packer pauses with a note. In the VM window, choose **18 or older** and finish setup. It should be the only setup screen. If another one appears, note its name (its skip is missing; please report it) and click through it. Return to the Terminal and press **Enter**. The build fails if Setup Assistant is still open.
+10. **Admin password.** The admin password is changed, and `agent-base-next` then replaces `agent-base`.
 
 Confirm the result:
 
@@ -492,7 +494,7 @@ You land in Claude Code, running in the VM in `~/work` on branch `agent/session-
 With `--gui`, the VM window shows the `agent` user's desktop (the image logs `agent` in automatically). Run `open -a Simulator` in the VM shell, or ask Claude to, to watch simulator runs.
 
 - **Don't close the VM window**: that shuts the VM down before your commits are collected. End the session from the Terminal.
-- On a new account's first login macOS may show setup screens (Apple Account, Siri…). They don't affect Claude, which works over SSH; see [§14](#14-troubleshooting).
+- macOS's first-login setup screens were skipped or answered when the image was built ([§6.3](#63-build-both-layers)), so the window should open on the desktop. If one appears anyway, see [§14](#14-troubleshooting).
 
 ### Continuing earlier work
 
@@ -854,7 +856,7 @@ Then check the firewall's monitor and `/opt/homebrew/var/log/tinyproxy/tinyproxy
 | `The VM stopped unexpectedly` at the end of a run | The VM window was closed or the VM crashed. `agent.sh` restarts it without a window to collect the commits; if that fails it keeps the VM and prints how to recover the work. |
 | A VM started without Softnet never gets an IP (`tart ip` fails) | The DHCP pool may be full of day-long leases from earlier VMs; shorten the lease ([§3](#shorter-dhcp-leases)) and wait for old ones to expire. |
 | Can't start a VM: limit reached | Only two macOS VMs can run at once. `tart list` shows running ones; `tart stop <name>`. |
-| macOS setup screens in the `--gui` window | First login of the `agent` account in each fresh clone. Harmless for Claude. Getting past them once in the image needs an extra build step. |
+| macOS setup screens in the `--gui` window | Harmless for Claude, which works over SSH. The image skips them (`SkipSetupItems` and the `DidSee…`/`LastSeen…` flags in the agent-user step of `agent.pkr.hcl`) and you answer the age range screen during the build. A screen that still appears is either new in this macOS version (add its key from Apple's [skip keys](https://github.com/apple/device-management/blob/release/other/skipkeys.yaml)) or one whose version-stamped flag lapsed after a macOS update (rebuild with `./agent.sh tools`). |
 | `BLOCKED: the agent's commits change files that define its own limits` | Intended: see [§11](#11-review-and-integrate-the-results). The work is on `agent-quarantine/<run>`. |
 | `Could not build the audit report.` | Check that `jq` is installed (`jq --version`). The raw data is still in `audit.jsonl` and `events.stream.jsonl`. |
 | A report shows calls as **blocked** that weren't denied | A blocked call is one with no recorded result. The last call of a run that was stopped, or a tool whose result hook didn't fire, also shows this way. |

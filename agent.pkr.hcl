@@ -529,8 +529,13 @@ build {
                SyncSetup SyncSetup2 TermsOfAddress TouchIDSetup TrueTonePrivacy Wallpaper; do
         sa "DidSee$k" -bool true
       done
+      sa DidSeeAppStore -bool true
+      # LastSeenGlassTintUpsell is the Liquid Glass look screen. The age range screen
+      # (LastSeenAgeRangeSelection) is left unseen on purpose: you answer it at the pause below.
       for k in LastSeenCloudProductVersion LastSeenDiagnosticsProductVersion LastSeenSiriProductVersion \
-               LastSeenIntelligenceProductVersion LastPreLoginTasksPerformedVersion; do
+               LastSeenIntelligenceProductVersion LastPreLoginTasksPerformedVersion \
+               LastSeenGlassTintUpsellProductVersion LastSeeniCloudStorageServicesProductVersion \
+               LastSeenSyncProductVersion; do
         sa "$k" "$os_ver"
       done
       sa LastSeenBuddyBuildVersion "$os_build"
@@ -539,6 +544,28 @@ build {
       sa SkipFirstLoginOptimization -bool true
       sa MiniBuddyShouldLaunchToResumeSetup -bool false
       sudo -u agent defaults write com.apple.assistant.support "Assistant Enabled" -bool false   # Siri off
+
+      # macOS 15+ also skips the screens named in SkipSetupItems, whatever the OS version, and
+      # it's the only way to skip some (OSShowcase, the "Welcome to macOS" screen). It normally
+      # comes from a profile, which macOS won't install silently, so write the managed copies as
+      # plain files (ManagedClient, not cfprefsd, owns that folder) and the local ones with
+      # defaults. Keys are from Apple's device-management skipkeys.yaml; unknown ones are ignored.
+      # There's no key for the age range screen.
+      skip=(Accessibility AppleID Appearance AppStore Biometric Diagnostics FileVault iCloudDiagnostics
+            iCloudStorage Intelligence LiquidGlass Location OSShowcase Privacy ScreenTime Siri
+            SoftwareUpdate TermsOfAddress TOS UnlockWithWatch UpdateCompleted Wallpaper Welcome)
+      sudo mkdir -p "/Library/Managed Preferences/agent"
+      for p in "/Library/Managed Preferences/com.apple.SetupAssistant.managed.plist" \
+               "/Library/Managed Preferences/agent/com.apple.SetupAssistant.managed.plist"; do
+        sudo plutil -create xml1 "$p"
+        sudo plutil -insert SkipSetupItems -array "$p"
+        for i in "$${skip[@]}"; do sudo plutil -insert SkipSetupItems -string "$i" -append "$p"; done
+        sudo chown root:wheel "$p"
+        sudo chmod 644 "$p"
+      done
+      sudo chmod 755 "/Library/Managed Preferences" "/Library/Managed Preferences/agent"
+      sudo defaults write /Library/Preferences/com.apple.SetupAssistant.managed SkipSetupItems -array "$${skip[@]}"
+      sudo -u agent defaults write com.apple.SetupAssistant.managed SkipSetupItems -array "$${skip[@]}"
 
       # Log in as agent at boot, so the VM window (agent.sh --gui) shows agent's
       # desktop and the Simulator it launches, and simulator/UI tests have a GUI session.
@@ -713,6 +740,44 @@ build {
           agent@localhost 'exec /bin/bash -c "read -r AGENT_PW && export AGENT_PW && exec /bin/bash -s"' ||
         { rc=$?; echo "Enabling Xcode MCP for agent failed with exit $rc (255: the SSH connection itself; see above)" >&2; exit 1; }
       completed=1
+    EOT
+    ]
+  }
+
+  # The age range screen can't be skipped or pre-answered (Screen Time stores the answer through
+  # a private service), so answer it once here and every clone inherits it. Reboot so agent
+  # logs in automatically; every other setup screen is skipped by now, so only it should appear.
+  provisioner "shell" {
+    expect_disconnect = true
+    inline            = ["sudo shutdown -r now"]
+  }
+
+  provisioner "shell" {
+    pause_before   = "20s"
+    inline_shebang = "/bin/bash -e"
+    inline = [<<-EOT
+      for _ in $(seq 60); do [ "$(stat -f %Su /dev/console)" = agent ] && break; sleep 2; done
+      [ "$(stat -f %Su /dev/console)" = agent ] || { echo "agent wasn't logged in automatically after the reboot (console user: $(stat -f %Su /dev/console))" >&2; exit 1; }
+      echo "agent is logged in."
+    EOT
+    ]
+  }
+
+  provisioner "breakpoint" {
+    note = "In the VM window (agent's desktop): choose the age range 18 or older and finish setup. If any other setup screen appears, note its name (its skip is missing) and click through it. Then press Enter here."
+  }
+
+  provisioner "shell" {
+    inline_shebang = "/bin/bash -e"
+    inline = [<<-EOT
+      if pgrep -u agent -x "Setup Assistant" >/dev/null; then
+        echo "Setup Assistant is still open in agent's session. Finish it in the VM window and rebuild." >&2
+        exit 1
+      fi
+      seen="$(sudo -u agent defaults read com.apple.SetupAssistant LastSeenAgeRangeSelectionProductVersion 2>/dev/null || true)"
+      if [ -n "$seen" ]; then echo "Age range screen answered (macOS $seen)."
+      else echo "Warning: no record that the age range screen was answered; it may appear again in clones." >&2
+      fi
     EOT
     ]
   }
