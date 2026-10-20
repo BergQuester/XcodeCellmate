@@ -433,6 +433,52 @@ build {
     ]
   }
 
+  # Skip macOS's first-login setup screens for every user, with Apple's supported mechanism:
+  # SkipSetupItems in a com.apple.SetupAssistant.managed profile. macOS installs profiles only
+  # with your approval, so open it in the VM and wait until you've approved it. (Plain files in
+  # /Library/Managed Preferences don't work: macOS rebuilds that folder at login.)
+  provisioner "file" {
+    source      = "${path.root}/SkipSetupAssistant.mobileconfig"
+    destination = "/tmp/SkipSetupAssistant.mobileconfig"
+  }
+
+  provisioner "shell" {
+    inline_shebang = "/bin/bash -e"
+    inline = [<<-EOT
+      id=local.tartvmconfigs.skipsetupassistant
+      installed() { sudo profiles list -all 2>/dev/null | grep -q "profileIdentifier: $id$"; }
+      if installed; then echo "Setup Assistant profile already installed."; exit 0; fi
+
+      p=/Users/Shared/SkipSetupAssistant.mobileconfig
+      sudo cp /tmp/SkipSetupAssistant.mobileconfig "$p" && sudo chmod 644 "$p"
+      steps="ACTION NEEDED in the VM window: approve the Setup Assistant profile.
+        1. In System Settings > General > Device Management, double-click
+           \"Skip Setup Assistant (agent VM images)\" under Downloaded.
+        2. Click Install, confirm, and enter the admin password: admin
+      (If System Settings isn't open or the profile isn't listed, double-click
+      $p in Finder, then repeat.) The build continues by itself once it's installed."
+      # Run in admin's GUI session (this SSH session isn't one): stage the profile, open the
+      # Device Management pane, and show the steps in a dialog too.
+      gui() { sudo launchctl asuser "$(id -u)" sudo -u "$(id -un)" "$@"; }
+      gui open "$p" || true
+      sleep 2
+      gui open "x-apple.systempreferences:com.apple.Profiles-Settings.extension" || true
+      gui osascript -e "display dialog \"$(printf '%s' "$steps" | sed 's/"/\\"/g')\" with title \"Approve profile\" buttons {\"OK\"} default button 1 giving up after 1800" >/dev/null 2>&1 </dev/null &
+
+      echo "=================================================================="
+      echo "$steps"
+      echo "=================================================================="
+      for i in $(seq 360); do
+        installed && { echo "Setup Assistant profile installed."; exit 0; }
+        [ $((i % 6)) -eq 0 ] && echo "Still waiting for you to approve the profile in the VM window ($((i / 6)) min; steps above)."
+        sleep 10
+      done
+      echo "The Setup Assistant profile wasn't approved within an hour." >&2
+      exit 1
+    EOT
+    ]
+  }
+
   provisioner "breakpoint" {
     note = "In the VM window: Xcode > Settings > Components > download Documentation (and add any other platforms you want). Then press Enter here."
   }
@@ -545,27 +591,12 @@ build {
       sa MiniBuddyShouldLaunchToResumeSetup -bool false
       sudo -u agent defaults write com.apple.assistant.support "Assistant Enabled" -bool false   # Siri off
 
-      # macOS 15+ also skips the screens named in SkipSetupItems, whatever the OS version, and
-      # it's the only way to skip some (OSShowcase, the "Welcome to macOS" screen). It normally
-      # comes from a profile, which macOS won't install silently, so write the managed copies as
-      # plain files (ManagedClient, not cfprefsd, owns that folder) and the local ones with
-      # defaults. Keys are from Apple's device-management skipkeys.yaml; unknown ones are ignored.
-      # There's no key for the age range screen.
-      skip=(Accessibility AppleID Appearance AppStore Biometric Diagnostics FileVault iCloudDiagnostics
-            iCloudStorage Intelligence LiquidGlass Location OSShowcase Privacy ScreenTime Siri
-            SoftwareUpdate TermsOfAddress TOS UnlockWithWatch UpdateCompleted Wallpaper Welcome)
-      sudo mkdir -p "/Library/Managed Preferences/agent"
-      for p in "/Library/Managed Preferences/com.apple.SetupAssistant.managed.plist" \
-               "/Library/Managed Preferences/agent/com.apple.SetupAssistant.managed.plist"; do
-        sudo plutil -create xml1 "$p"
-        sudo plutil -insert SkipSetupItems -array "$p"
-        for i in "$${skip[@]}"; do sudo plutil -insert SkipSetupItems -string "$i" -append "$p"; done
-        sudo chown root:wheel "$p"
-        sudo chmod 644 "$p"
-      done
-      sudo chmod 755 "/Library/Managed Preferences" "/Library/Managed Preferences/agent"
-      sudo defaults write /Library/Preferences/com.apple.SetupAssistant.managed SkipSetupItems -array "$${skip[@]}"
-      sudo -u agent defaults write com.apple.SetupAssistant.managed SkipSetupItems -array "$${skip[@]}"
+      # The flags above are a fallback. The screens that need SkipSetupItems (Apple Account,
+      # Get Started, Welcome to macOS…) are skipped by the profile installed in the Xcode layer.
+      sudo profiles list -all 2>/dev/null | grep -q "profileIdentifier: local.tartvmconfigs.skipsetupassistant$" || {
+        echo "The Setup Assistant profile isn't installed in xcode-base. Rebuild the Xcode layer (./agent.sh xcode <xip>) and approve it at the pause." >&2
+        exit 1
+      }
 
       # Log in as agent at boot, so the VM window (agent.sh --gui) shows agent's
       # desktop and the Simulator it launches, and simulator/UI tests have a GUI session.

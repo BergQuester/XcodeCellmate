@@ -11,6 +11,7 @@ The whole system is two files:
 | --- | --- |
 | `agent.pkr.hcl` | Packer template that builds the two VM images (Xcode layer and agent layer). |
 | `agent.sh` | Builds the images, and runs jobs and sessions in disposable clones of them. |
+| `SkipSetupAssistant.mobileconfig` | Configuration profile that skips macOS's first-login setup screens in the images; you approve it once per Xcode-layer build. |
 
 `CLAUDE-tart-vm-section.md` holds the section to paste into your project's `CLAUDE.md`; the same text is in [Appendix A](#appendix-a-claudemd-section).
 
@@ -160,6 +161,7 @@ Put the files in a folder of their own, for example `~/tartvmconfigs`:
 tartvmconfigs/
 ├── agent.sh
 ├── agent.pkr.hcl
+├── SkipSetupAssistant.mobileconfig
 ├── env.template
 ├── CLAUDE-tart-vm-section.md
 └── README.md
@@ -225,12 +227,13 @@ What happens:
 2. **VM boot and SSH.** Packer clones it to `xcode-base-next`, resizes the disk, boots it and waits for SSH. A VM window opens. One to three minutes is normal.
 3. **Xcode install** (15–30+ minutes, little output). The `.xip` is expanded, moved to `/Applications/<xip name>.app`, every other Xcode is removed, `/Applications/Xcode.app` is symlinked to it, it's selected with `xcode-select` (which also provides the command line tools), the license is accepted and first-launch setup runs.
 4. **Simulator runtimes.** All existing runtimes are deleted, then the platforms you asked for are installed (by default, the latest iOS runtime for this Xcode; several GB each). The SDKs themselves ship inside Xcode. See [§6.4](#64-choose-sdk-platforms-and-versions).
-5. **Documentation (manual step).** Packer pauses with a note. In the VM window, open Xcode. If its *Components* sheet appears, click **Download & Install** (iOS is already installed, so it should finish quickly). Then open **Xcode → Settings → Components** and download **Documentation** if it's offered. Quit Xcode, return to the Terminal, and press **Enter**.
-6. **Checks.** The Xcode version, iOS SDK version and installed runtimes are printed. Confirm they're what you expect.
-7. **Swap.** `xcode-base-next` replaces `xcode-base`.
-8. **Agent layer** (a few minutes, automatic apart from step 9): Homebrew packages (installing `brew_packages`, then removing the base image's packages not in `brew_keep`; the log lists what was removed and what's left), the non-admin `agent` user with your SSH key and automatic login (with macOS's first-login setup screens skipped: Apple Account, Liquid Glass, Get Started, Welcome to macOS, Siri, and the rest), Claude Code, git identity and push backstop, Claude Code deny rules (printed as JSON so you can check them), Xcode's MCP server for Claude (headless, printed with its status; see [§8.5](#85-xcode-mcp-tools)).
-9. **Age range (manual step).** macOS has no way to skip or pre-answer this screen, so the VM restarts, logs `agent` in, and Packer pauses with a note. In the VM window, choose **18 or older** and finish setup. It should be the only setup screen. If another one appears, note its name (its skip is missing; please report it) and click through it. Return to the Terminal and press **Enter**. The build fails if Setup Assistant is still open.
-10. **Admin password.** The admin password is changed, and `agent-base-next` then replaces `agent-base`.
+5. **Setup Assistant profile (manual step).** The build installs `SkipSetupAssistant.mobileconfig`, which tells macOS to skip its first-login setup screens (Apple Account, Get Started, Welcome to macOS, Liquid Glass, Siri, and the rest) for every user of the images. macOS installs profiles only with your approval, so the build opens the profile and **System Settings → General → Device Management** (direct link inside the VM: `x-apple.systempreferences:com.apple.Profiles-Settings.extension`) and shows the steps in a dialog in the VM window and in the Terminal. Double-click **Skip Setup Assistant (agent VM images)** under *Downloaded*, click **Install**, confirm, and enter the admin password (`admin` at this point). If it isn't listed, double-click `/Users/Shared/SkipSetupAssistant.mobileconfig` in Finder and try again. The build waits up to an hour, reminding you every minute, and continues by itself once the profile is installed.
+6. **Documentation (manual step).** Packer pauses with a note. In the VM window, open Xcode. If its *Components* sheet appears, click **Download & Install** (iOS is already installed, so it should finish quickly). Then open **Xcode → Settings → Components** and download **Documentation** if it's offered. Quit Xcode, return to the Terminal, and press **Enter**.
+7. **Checks.** The Xcode version, iOS SDK version and installed runtimes are printed. Confirm they're what you expect.
+8. **Swap.** `xcode-base-next` replaces `xcode-base`.
+9. **Agent layer** (a few minutes, automatic apart from step 10): Homebrew packages (installing `brew_packages`, then removing the base image's packages not in `brew_keep`; the log lists what was removed and what's left), the non-admin `agent` user with your SSH key and automatic login (the build stops here if `xcode-base` doesn't have the Setup Assistant profile from step 5), Claude Code, git identity and push backstop, Claude Code deny rules (printed as JSON so you can check them), Xcode's MCP server for Claude (headless, printed with its status; see [§8.5](#85-xcode-mcp-tools)).
+10. **Age range (manual step).** macOS has no way to skip or pre-answer this screen, so the VM restarts, logs `agent` in, and Packer pauses with a note. In the VM window, choose **18 or older** and finish setup. It should be the only setup screen. If another one appears, note its name (its skip is missing; please report it) and click through it. Return to the Terminal and press **Enter**. The build fails if Setup Assistant is still open.
+11. **Admin password.** The admin password is changed, and `agent-base-next` then replaces `agent-base`.
 
 Confirm the result:
 
@@ -856,7 +859,7 @@ Then check the firewall's monitor and `/opt/homebrew/var/log/tinyproxy/tinyproxy
 | `The VM stopped unexpectedly` at the end of a run | The VM window was closed or the VM crashed. `agent.sh` restarts it without a window to collect the commits; if that fails it keeps the VM and prints how to recover the work. |
 | A VM started without Softnet never gets an IP (`tart ip` fails) | The DHCP pool may be full of day-long leases from earlier VMs; shorten the lease ([§3](#shorter-dhcp-leases)) and wait for old ones to expire. |
 | Can't start a VM: limit reached | Only two macOS VMs can run at once. `tart list` shows running ones; `tart stop <name>`. |
-| macOS setup screens in the `--gui` window | Harmless for Claude, which works over SSH. The image skips them (`SkipSetupItems` and the `DidSee…`/`LastSeen…` flags in the agent-user step of `agent.pkr.hcl`) and you answer the age range screen during the build. A screen that still appears is either new in this macOS version (add its key from Apple's [skip keys](https://github.com/apple/device-management/blob/release/other/skipkeys.yaml)) or one whose version-stamped flag lapsed after a macOS update (rebuild with `./agent.sh tools`). |
+| macOS setup screens in the `--gui` window | Harmless for Claude, which works over SSH. The image skips them with `SkipSetupAssistant.mobileconfig` (approved in the Xcode-layer build) plus the `DidSee…`/`LastSeen…` flags in the agent-user step of `agent.pkr.hcl`, and you answer the age range screen during the build. Check the profile is installed: as `admin`, `sudo profiles list -all \| grep skipsetupassistant`. A screen that still appears is probably new in this macOS version: add its key from Apple's [skip keys](https://github.com/apple/device-management/blob/release/other/skipkeys.yaml) to the profile and rebuild both layers. |
 | `BLOCKED: the agent's commits change files that define its own limits` | Intended: see [§11](#11-review-and-integrate-the-results). The work is on `agent-quarantine/<run>`. |
 | `Could not build the audit report.` | Check that `jq` is installed (`jq --version`). The raw data is still in `audit.jsonl` and `events.stream.jsonl`. |
 | A report shows calls as **blocked** that weren't denied | A blocked call is one with no recorded result. The last call of a run that was stopped, or a tool whose result hook didn't fire, also shows this way. |
