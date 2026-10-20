@@ -43,7 +43,59 @@ build() {  # build <layer> [packer args...]  -> builds "<layer>-base-next", then
   tart delete "$layer-base-next" 2>/dev/null || true
   packer init "$PKR" >/dev/null
   packer build -only="$layer.*" -var suffix=-next "$@" "$PKR"
+  if [ "$layer" = agent ]; then age_range agent-base-next; fi
   swap "$layer-base"
+}
+
+vexec() { tart exec "$AR_VM" "$@"; }   # run a command in the age_range VM as its console user
+
+# macOS's age range screen can't be skipped or pre-answered, so agent answers it once in the new
+# image and every clone inherits the answer. It happens here, in a boot started from the host,
+# because rebooting inside the Packer build breaks the simulators (see the end of the agent layer
+# in agent.pkr.hcl). agent logs in automatically; the profile skips every other setup screen.
+age_range() {  # age_range <vm>
+  AR_VM="$1"
+  tart run "$AR_VM" >/dev/null 2>&1 &
+  local login="" i
+  for i in $(seq 60); do
+    login="$(vexec /usr/bin/stat -f %Su /dev/console 2>/dev/null || true)"
+    [ "$login" = agent ] && break
+    sleep 5
+  done
+  if [ "$login" != agent ]; then
+    echo "$AR_VM: agent wasn't logged in automatically (console user: ${login:-unknown})." >&2
+    tart stop "$AR_VM" >/dev/null 2>&1 || true
+    exit 1
+  fi
+  cat <<EOF
+
+==================================================================
+ACTION NEEDED in the VM window ($AR_VM, agent's desktop):
+  Choose the age range 18 or older and finish setup.
+  It should be the only setup screen. If another one appears, note
+  its name (its skip is missing from SkipSetupAssistant.mobileconfig)
+  and click through it.
+Don't close the VM window. Come back here when you're done.
+==================================================================
+EOF
+  read -rp "Press Enter when setup is finished... " _
+  local ok=1
+  if vexec /usr/bin/pgrep -x "Setup Assistant" >/dev/null 2>&1; then
+    echo "Setup Assistant is still open in the VM. Finish it and run the build again." >&2; ok=0
+  fi
+  if [ -n "$(vexec /usr/bin/defaults read com.apple.SetupAssistant LastSeenAgeRangeSelectionProductVersion 2>/dev/null || true)" ]; then
+    echo "Age range screen answered."
+  else
+    echo "Warning: no record that the age range screen was answered; it may appear again in clones." >&2
+  fi
+  # Same check as check_runtimes in agent.pkr.hcl: Unusable registrations mean clones lose their simulators.
+  if vexec /usr/bin/xcrun simctl runtime list 2>&1 | grep -i unusable; then
+    echo "Simulator runtime registrations above are Unusable; clones would lose their simulators." >&2; ok=0
+  else
+    echo "Simulator runtime registrations OK."
+  fi
+  tart stop "$AR_VM" >/dev/null 2>&1 || true
+  [ "$ok" = 1 ] || exit 1
 }
 
 # ---------- throwaway VMs ----------

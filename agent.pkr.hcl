@@ -319,6 +319,10 @@ variable "admin_password" {
 locals {
   agent_password = uuidv4() # agent logs in by key only; this just needs to be unguessable
 
+  # Fails if a simulator runtime registration is Unusable: clones would then lose every runtime
+  # shortly after login (see the note at the end of the agent layer). agent.sh runs it too.
+  check_runtimes = "if xcrun simctl runtime list 2>&1 | grep -i unusable; then echo 'Simulator runtime registrations above are Unusable; clones would lose their simulators. Was the VM rebooted from inside during the build?' >&2; exit 1; fi; echo 'Simulator runtime registrations OK.'"
+
   # Audit hook: every tool call, its result, failures and denials are appended to
   # ~/.agent-audit/events.jsonl, which agent.sh captures live on your Mac.
   audit_hook = [{ matcher = "*", hooks = [{ type = "command", command = "/usr/local/libexec/agent-audit" }] }]
@@ -433,6 +437,11 @@ build {
     ]
   }
 
+  provisioner "breakpoint" {
+    note = "In the VM window: Xcode > Settings > Components > download Documentation (and add any other platforms you want). If macOS asks for the admin password, it's: admin. Then press Enter here."
+  }
+
+  # After the documentation download, so only one thing happens in the VM at a time.
   # Skip macOS's first-login setup screens for every user, with Apple's supported mechanism:
   # SkipSetupItems in a com.apple.SetupAssistant.managed profile. macOS installs profiles only
   # with your approval, so open it in the VM and wait until you've approved it. (Plain files in
@@ -452,9 +461,10 @@ build {
       p=/Users/Shared/SkipSetupAssistant.mobileconfig
       sudo cp /tmp/SkipSetupAssistant.mobileconfig "$p" && sudo chmod 644 "$p"
       steps="ACTION NEEDED in the VM window: approve the Setup Assistant profile.
+      The VM's admin password is currently: admin
         1. In System Settings > General > Device Management, double-click
            \"Skip Setup Assistant (agent VM images)\" under Downloaded.
-        2. Click Install, confirm, and enter the admin password: admin
+        2. Click Install, confirm, and enter the admin password (admin).
       (If System Settings isn't open or the profile isn't listed, double-click
       $p in Finder, then repeat.) The build continues by itself once it's installed."
       # Run in admin's GUI session (this SSH session isn't one): stage the profile, open the
@@ -479,15 +489,12 @@ build {
     ]
   }
 
-  provisioner "breakpoint" {
-    note = "In the VM window: Xcode > Settings > Components > download Documentation (and add any other platforms you want). Then press Enter here."
-  }
-
   provisioner "shell" {
     inline = [
       "xcodebuild -version",
       "xcrun --sdk iphoneos --show-sdk-version",
       "xcrun simctl list runtimes",
+      local.check_runtimes,
     ]
   }
 }
@@ -775,42 +782,12 @@ build {
     ]
   }
 
-  # The age range screen can't be skipped or pre-answered (Screen Time stores the answer through
-  # a private service), so answer it once here and every clone inherits it. Reboot so agent
-  # logs in automatically; every other setup screen is skipped by now, so only it should appear.
+  # The age range screen is answered after this build, by agent.sh in a boot from the host
+  # (age_range): never reboot inside a build. A reboot from inside the VM makes simdiskimaged
+  # re-register every simulator runtime and mark the originals Unusable; each clone then cleans
+  # those up at login, force-unmounting the shared volumes, and the simulators vanish.
   provisioner "shell" {
-    expect_disconnect = true
-    inline            = ["sudo shutdown -r now"]
-  }
-
-  provisioner "shell" {
-    pause_before   = "20s"
-    inline_shebang = "/bin/bash -e"
-    inline = [<<-EOT
-      for _ in $(seq 60); do [ "$(stat -f %Su /dev/console)" = agent ] && break; sleep 2; done
-      [ "$(stat -f %Su /dev/console)" = agent ] || { echo "agent wasn't logged in automatically after the reboot (console user: $(stat -f %Su /dev/console))" >&2; exit 1; }
-      echo "agent is logged in."
-    EOT
-    ]
-  }
-
-  provisioner "breakpoint" {
-    note = "In the VM window (agent's desktop): choose the age range 18 or older and finish setup. If any other setup screen appears, note its name (its skip is missing) and click through it. Then press Enter here."
-  }
-
-  provisioner "shell" {
-    inline_shebang = "/bin/bash -e"
-    inline = [<<-EOT
-      if pgrep -u agent -x "Setup Assistant" >/dev/null; then
-        echo "Setup Assistant is still open in agent's session. Finish it in the VM window and rebuild." >&2
-        exit 1
-      fi
-      seen="$(sudo -u agent defaults read com.apple.SetupAssistant LastSeenAgeRangeSelectionProductVersion 2>/dev/null || true)"
-      if [ -n "$seen" ]; then echo "Age range screen answered (macOS $seen)."
-      else echo "Warning: no record that the age range screen was answered; it may appear again in clones." >&2
-      fi
-    EOT
-    ]
+    inline = [local.check_runtimes]
   }
 
   # Last: retire admin/admin. sysadminctl doesn't change the login keychain's password, so
