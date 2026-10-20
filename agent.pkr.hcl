@@ -666,10 +666,16 @@ build {
       tmp="$(mktemp -d)"
       ssh-keygen -q -t ed25519 -N '' -f "$tmp/key"
       sudo cp -p /Users/agent/.ssh/authorized_keys "$tmp/authorized_keys"
+      # With an EXIT trap, bash 3.2 exits 0 after a syntax error, so Packer would carry on.
+      # The last line sets completed=1; any other exit is a failure.
+      completed=0
       cleanup() {
+        rc=$?
         sudo rm -f /etc/sudoers.d/zz-agent-mcp-server
         sudo cp -p "$tmp/authorized_keys" /Users/agent/.ssh/authorized_keys
         rm -rf "$tmp"
+        if [ "$completed" != 1 ] && [ "$rc" = 0 ]; then rc=1; fi
+        exit "$rc"
       }
       trap cleanup EXIT
       sudo -u agent tee -a /Users/agent/.ssh/authorized_keys < "$tmp/key.pub" >/dev/null
@@ -678,26 +684,35 @@ build {
       sudo visudo -cqf /etc/sudoers.d/zz-agent-mcp-server
 
       # The password goes over stdin (first line), not the command line.
-      { printf '%s
-' "$AGENT_PW"; cat <<'MCP'; } |
+      { printf '%s\n' "$AGENT_PW"; cat <<'MCP'; } |
       set -e
+      trap 'echo "MCP setup in agent session: failed at line $LINENO (exit $?)" >&2' ERR
+      echo "MCP setup in agent session: $(id -un), keychain"
       kc=login.keychain
       [ -f ~/Library/Keychains/login.keychain-db ] || security create-keychain -p "$AGENT_PW" "$kc"
       security list-keychains -d user -s "$kc"
       security default-keychain -d user -s "$kc"
-      security login-keychain -d user -s "$kc"
+      # Fails (silently) in an SSH session; the name login.keychain is what makes it agent's
+      # login keychain at sign-in anyway.
+      security login-keychain -d user -s "$kc" 2>/dev/null || echo "MCP setup in agent session: (couldn't mark it as the login keychain; continuing)"
       security unlock-keychain -p "$AGENT_PW" "$kc"
-      sudo /usr/bin/xcrun mcp-server enable --unsafe-always-allow-all-agents
-      sudo /usr/bin/xcrun mcp-server allow-folder /Users/agent/work --always
+      echo "MCP setup in agent session: mcp-server"
+      sudo -n /usr/bin/xcrun mcp-server enable --unsafe-always-allow-all-agents
+      sudo -n /usr/bin/xcrun mcp-server allow-folder /Users/agent/work --always
       security lock-keychain "$kc"
-      MCP
-        ssh -i "$tmp/key" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
-          agent@localhost 'exec /bin/bash -c "read -r AGENT_PW && export AGENT_PW && exec /bin/bash -s"'
-
+      # Checked here, in agent's session: run from admin's (e.g. via sudo -u agent), status
+      # reports admin's settings, not agent's.
       echo "Xcode MCP status for agent:"
-      sudo -u agent -H xcrun mcp-server status | tee "$tmp/status"
-      grep -q '^Permission: enabled' "$tmp/status" ||
-        { echo "Xcode MCP isn't enabled for agent" >&2; exit 1; }
+      xcrun mcp-server status | tee /tmp/agent-mcp-status
+      grep -q '^Permission: enabled' /tmp/agent-mcp-status
+      ls ~/Library/Keychains/login.keychain-db
+      ls ~/"Library/Group Containers/group.com.apple.dt.Xcode.SecureSettingsContainer/CodingAssistant/HeadlessPermissions/mcp-server.json"
+      rm -f /tmp/agent-mcp-status
+      MCP
+        ssh -i "$tmp/key" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes \
+          agent@localhost 'exec /bin/bash -c "read -r AGENT_PW && export AGENT_PW && exec /bin/bash -s"' ||
+        { rc=$?; echo "Enabling Xcode MCP for agent failed with exit $rc (255: the SSH connection itself; see above)" >&2; exit 1; }
+      completed=1
     EOT
     ]
   }
