@@ -71,7 +71,7 @@ variable "claude_deny_rules" {
     "Bash(git submodule add *)",
     "Bash(git remote add *)",
     "Bash(git remote set-url *)",
-    "Bash(git switch *)",              # only the agent branch is collected
+    "Bash(git switch *)", # only the agent branch is collected
     "Bash(git checkout -b *)",
     "Bash(git branch -d *)",
     "Bash(git branch -D *)",
@@ -82,10 +82,10 @@ variable "claude_deny_rules" {
     "Bash(git filter-branch *)",
     "Bash(git filter-repo *)",
     "Bash(git update-ref *)",
-    "Bash(git config --global *)",     # hooksPath, credential helper
+    "Bash(git config --global *)", # hooksPath, credential helper
 
     # --- GitHub CLI: reading issues/PRs is allowed; everything else blocked ---
-    "Bash(gh api *)",                  # arbitrary API calls, any repo the token sees
+    "Bash(gh api *)", # arbitrary API calls, any repo the token sees
     "Bash(gh auth *)",
     "Bash(gh browse *)",
     "Bash(gh repo *)",
@@ -97,7 +97,7 @@ variable "claude_deny_rules" {
     "Bash(gh pr close *)",
     "Bash(gh pr reopen *)",
     "Bash(gh pr ready *)",
-    "Bash(gh pr checkout *)",          # would switch branches
+    "Bash(gh pr checkout *)", # would switch branches
     "Bash(gh issue create *)",
     "Bash(gh issue comment *)",
     "Bash(gh issue edit *)",
@@ -123,7 +123,7 @@ variable "claude_deny_rules" {
     "WebSearch",
     "Bash(curl *)",
     "Bash(wget *)",
-    "Bash(open http*)",                # opening URLs in a browser
+    "Bash(open http*)", # opening URLs in a browser
     "Bash(open -a Safari *)",
     "Bash(osascript *)",
     "Bash(nc *)",
@@ -138,7 +138,7 @@ variable "claude_deny_rules" {
     "Bash(rsync *)",
 
     # --- Claude Code changing its own setup ---
-    "Bash(claude *)",                  # nested sessions, `claude mcp add`, config changes
+    "Bash(claude *)", # nested sessions, `claude mcp add`, config changes
 
     # --- Files that define the agent's limits (Edit rules cover every file-editing tool) ---
     # In the repo checkout: agent instructions, project settings/agents/hooks, MCP config.
@@ -168,7 +168,7 @@ variable "claude_deny_rules" {
     "Edit(~/.bashrc)",
     "Edit(~/.profile)",
     "Edit(//Library/Application Support/ClaudeCode/**)",
-    "Edit(~/.agent-audit/**)",         # the audit log of tool calls
+    "Edit(~/.agent-audit/**)", # the audit log of tool calls
 
     # --- Signing, notarization and distribution ---
     "Bash(codesign *)",
@@ -211,11 +211,11 @@ variable "claude_deny_rules" {
     "Bash(/bin/bash *)",
     "Bash(/bin/sh *)",
     "Bash(/bin/zsh *)",
-    "Bash(env *)",                     # `env python3 …` and similar indirection
+    "Bash(env *)", # `env python3 …` and similar indirection
     "Bash(eval *)",
     "Bash(exec *)",
     "Bash(source *)",
-    "Bash(./*.sh*)",                   # running shell scripts directly
+    "Bash(./*.sh*)", # running shell scripts directly
     # Bare forms, for input piped in (e.g. `cat x | python3`).
     "Bash(python)",
     "Bash(python3)",
@@ -316,9 +316,14 @@ variable "admin_password" {
   sensitive = true
 }
 
-locals {
-  agent_password = uuidv4() # agent logs in by key only; this just needs to be unguessable
+# Fixed so you can unlock the VM's lock screen as agent. SSH as agent stays key-only.
+variable "agent_password" {
+  type      = string
+  default   = "copper-lantern-meadow-27"
+  sensitive = true
+}
 
+locals {
   # Fails if a simulator runtime registration is Unusable: clones would then lose every runtime
   # shortly after login (see the note at the end of the agent layer). agent.sh runs it too.
   check_runtimes = "if xcrun simctl runtime list 2>&1 | grep -i unusable; then echo 'Simulator runtime registrations above are Unusable; clones would lose their simulators. Was the VM rebooted from inside during the build?' >&2; exit 1; fi; echo 'Simulator runtime registrations OK.'"
@@ -375,7 +380,7 @@ build {
   sources = ["source.tart-cli.xcode"]
 
   provisioner "shell" {
-    inline_shebang   = "/bin/bash -e"
+    inline_shebang = "/bin/bash -e"
     environment_vars = [
       "XIP=/Volumes/My Shared Files/xcode/${var.xcode_xip_name}",
       "SDK_PLATFORMS=${join(";", var.sdk_platforms)}",
@@ -560,7 +565,7 @@ build {
   provisioner "shell" {
     inline_shebang = "/bin/bash -e"
     environment_vars = [
-      "AGENT_PW=${local.agent_password}",
+      "AGENT_PW=${var.agent_password}",
       "AGENT_SSH_PUBKEY=${trimspace(file(pathexpand(var.ssh_pubkey_path)))}",
     ]
     inline = [<<-EOT
@@ -622,6 +627,12 @@ build {
       echo "$AGENT_SSH_PUBKEY" | sudo -u agent tee /Users/agent/.ssh/authorized_keys >/dev/null
       sudo chmod 700 /Users/agent/.ssh
       sudo chmod 600 /Users/agent/.ssh/authorized_keys
+      # agent's password is fixed (for the lock screen), so sshd mustn't accept it.
+      sudo mkdir -p /etc/ssh/sshd_config.d
+      printf '%s\n' 'Match User agent' '  PasswordAuthentication no' '  KbdInteractiveAuthentication no' |
+        sudo tee /etc/ssh/sshd_config.d/100-agent-key-only.conf >/dev/null
+      sudo sshd -T -C user=agent,host=localhost,addr=127.0.0.1 | grep -qx 'passwordauthentication no' ||
+        { echo "sshd still accepts passwords for agent" >&2; exit 1; }
 
       # Base images may limit Remote Login to Administrators (the com.apple.access_ssh group
       # exists); sshd then accepts agent's key and drops the connection. Allow agent too.
@@ -723,7 +734,7 @@ build {
   # keychain created and unlocked with its password. The key and the sudo rule are removed after.
   provisioner "shell" {
     inline_shebang   = "/bin/bash -e"
-    environment_vars = ["AGENT_PW=${local.agent_password}"]
+    environment_vars = ["AGENT_PW=${var.agent_password}"]
     inline = [<<-EOT
       # Jobs clone the repo into this (empty) folder; Xcode may serve projects only under it.
       sudo -u agent mkdir -p /Users/agent/work

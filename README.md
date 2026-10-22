@@ -683,6 +683,7 @@ Claude Code is installed when the agent layer is built. Rebuild periodically (`.
 - **Deny rules match commands as written.** `python3 -c 'import urllib…'`, `/usr/bin/curl`, or a script containing `git push` won't match. They're a backstop.
 - **Auto mode reduces risk but isn't a guarantee.** The classifier can still allow a risky action, which is why Anthropic recommends running it in isolated environments like these VMs.
 - **Network-level filtering isn't set up by default.** See [Optional: allowlist network access from your Mac](#optional-allowlist-network-access-from-your-mac) for enforcing it on your Mac with a proxy and a host firewall.
+- **The agent can know its own password** (it's in this repository). That gives it nothing it doesn't already have: agent isn't an admin, and SSH as agent accepts only your key.
 - **`xcode-base` keeps the default `admin`/`admin` password.** It never runs jobs and stays on your Mac, but don't share or push it to a registry.
 - **Xcode betas** are pre-release software running agent-written code; that's another reason the review step matters.
 
@@ -875,6 +876,8 @@ tart list                                   # find the VM name
 ssh admin@"$(tart ip <name>)"               # as admin, with your admin password
 ssh agent@"$(tart ip <name>)"               # as agent, with your SSH key
 ```
+
+If a VM window shows the lock screen, unlock it as **agent** with the password **`copper-lantern-meadow-27`**. It's the same in every image, so it's in this repository; it works only at the VM's own screen, since SSH as agent accepts only your key. To use a different one, set `PKR_VAR_agent_password` before building the agent layer.
 
 ---
 
