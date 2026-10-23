@@ -89,6 +89,16 @@ EOF
     echo "Warning: no record that the age range screen was answered; it may appear again in clones." >&2
   fi
   # Same check as check_runtimes in agent.pkr.hcl: Unusable registrations mean clones lose their simulators.
+  # This boot can register cryptex runtimes twice too; remove the stale "Cryptex Mount Preferred" ones first.
+  vexec /bin/bash -c '
+    for _ in $(seq 60); do xcrun simctl runtime list | grep -q "(Copying)" || break; sleep 5; done
+    xcrun simctl runtime list | sed -n "s/.*(\([^)]*\)) - \([0-9A-F-]\{36\}\) (Unusable - Cryptex Mount Preferred.*/\1 \2/p" |
+      while read -r build id; do
+        xcrun simctl runtime list | grep -q "($build) - .* (Ready)" || continue
+        echo "Removing duplicate simulator runtime registration $id ($build, Cryptex Mount Preferred)"
+        xcrun simctl runtime delete "$id"
+      done
+    for _ in $(seq 15); do xcrun simctl runtime list | grep -q "Cryptex Mount Preferred" || break; sleep 2; done' || true
   if vexec /usr/bin/xcrun simctl runtime list 2>&1 | grep -i unusable; then
     echo "Simulator runtime registrations above are Unusable; clones would lose their simulators." >&2; ok=0
   else

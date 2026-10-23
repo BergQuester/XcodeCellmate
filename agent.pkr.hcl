@@ -326,7 +326,21 @@ variable "agent_password" {
 locals {
   # Fails if a simulator runtime registration is Unusable: clones would then lose every runtime
   # shortly after login (see the note at the end of the agent layer). agent.sh runs it too.
-  check_runtimes = "if xcrun simctl runtime list 2>&1 | grep -i unusable; then echo 'Simulator runtime registrations above are Unusable; clones would lose their simulators. Was the VM rebooted from inside during the build?' >&2; exit 1; fi; echo 'Simulator runtime registrations OK.'"
+  # First removes the one harmless kind: cryptex runtimes (iOS/visionOS 27) are sometimes
+  # registered twice at boot, and simdiskimaged marks the original "Cryptex Mount Preferred".
+  # Deleting that registration keeps the files, which its Ready twin of the same build uses.
+  check_runtimes = <<-EOT
+    for _ in $(seq 60); do xcrun simctl runtime list | grep -q '(Copying)' || break; sleep 5; done
+    xcrun simctl runtime list | sed -n 's/.*(\([^)]*\)) - \([0-9A-F-]\{36\}\) (Unusable - Cryptex Mount Preferred.*/\1 \2/p' |
+      while read -r build id; do
+        xcrun simctl runtime list | grep -q "($build) - .* (Ready)" || continue
+        echo "Removing duplicate simulator runtime registration $id ($build, Cryptex Mount Preferred)"
+        xcrun simctl runtime delete "$id"
+      done
+    for _ in $(seq 15); do xcrun simctl runtime list | grep -q 'Cryptex Mount Preferred' || break; sleep 2; done
+    if xcrun simctl runtime list 2>&1 | grep -i unusable; then echo 'Simulator runtime registrations above are Unusable; clones would lose their simulators. Was the VM rebooted from inside during the build?' >&2; exit 1; fi
+    echo 'Simulator runtime registrations OK.'
+  EOT
 
   # Audit hook: every tool call, its result, failures and denials are appended to
   # ~/.agent-audit/events.jsonl, which agent.sh captures live on your Mac.
