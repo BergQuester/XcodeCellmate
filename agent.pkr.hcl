@@ -106,7 +106,12 @@ variable "claude_deny_rules" {
     "Bash(gh issue delete *)",
     "Bash(gh issue transfer *)",
     "Bash(gh issue develop *)",
-    "Bash(gh release *)",
+    "Bash(gh release create *)", # list, view and verify stay allowed
+    "Bash(gh release edit *)",
+    "Bash(gh release delete *)",
+    "Bash(gh release delete-asset *)",
+    "Bash(gh release upload *)",
+    "Bash(gh release download *)", # fetches binaries, like curl/wget
     "Bash(gh gist *)",
     "Bash(gh workflow *)",
     "Bash(gh run *)",
