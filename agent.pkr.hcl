@@ -352,6 +352,8 @@ locals {
   audit_hook = [{ matcher = "*", hooks = [{ type = "command", command = "/usr/local/libexec/agent-audit" }] }]
   managed_settings = {
     permissions = { deny = var.claude_deny_rules }
+    # No Co-Authored-By trailer on the agent's commits or attribution line in PRs.
+    attribution = { commit = "", pr = "" }
     hooks = {
       PreToolUse         = local.audit_hook
       PostToolUse        = local.audit_hook
